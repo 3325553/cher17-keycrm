@@ -15,7 +15,7 @@
  * Копії бере не з файлу, а з самого шлюзу: замовлення з 01.11, у яких є товари.
  * Так відправка працює одразу, без перезбирання і без передачі файлів.
  */
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "fs";
 import { SDK } from "./sdk.generated";
 import { convertSiteOrderToCRM, formatPhoneNumber, parseShippingAddress, validateSiteOrder } from "./utils";
 import { isCrmRejection, getCrmRequestRate } from "./crm-guard";
@@ -28,8 +28,20 @@ const REQUEST_PAUSE_MS = 250;
 const MAX_ATTEMPTS = 3;
 /** Скільки карток забираємо за один запит під час звірки (стеля KeyCRM — 50). */
 const CARD_SCAN_PAGE = 50;
-/** Межа карток, які переглядаємо за період: 900 карток ≈ 18 запитів ≈ 1 хвилина. */
-const CARD_SCAN_MAX_PAGES = 900 / CARD_SCAN_PAGE;
+/** Джерело «Замовлення» — чати й дзвінки в звірку не беремо, інакше квоти не стане. */
+const ORDER_SOURCE_ID = 2;
+/** Межа карток, які переглядаємо за період: 1500 карток ≈ 30 запитів. */
+const CARD_SCAN_MAX_PAGES = Math.ceil(1500 / CARD_SCAN_PAGE);
+/** Скільки замовлень беремо за запит зі списку замовлень. */
+const ORDER_SCAN_PAGE = 50;
+/** Межа: 2000 замовлень ≈ 40 запитів. */
+const ORDER_SCAN_MAX_PAGES = Math.ceil(2000 / ORDER_SCAN_PAGE);
+
+/**
+ * Номер замовлення сайту → картка CRM. Знімається один раз за прогін
+ * і далі використовується як точна відповідь «картка є / немає».
+ */
+const orderUuids = new Map<string, string>();
 
 const api = new SDK("https://openapi.keycrm.app/v1", Bun.env["KEYCRM_KEY"]);
 
@@ -199,6 +211,55 @@ async function pullCopies(): Promise<OrderCopy[]> {
   return copies;
 }
 
+/**
+ * Дописує зняті копії в архів репозиторію (об’єднання, без дублів).
+ * Архів зберігає те, що шлюз уже витіснив або витіснить сьогодні.
+ */
+function mergeIntoArchive(copies: OrderCopy[]): void {
+  // Пишу туди, звідки реально читаю архів: на сервері збірка лежить у /tmp,
+  // і REPO_DIR там указує в корінь диска — такого каталогу не існує.
+  const dirs = archiveFiles().map((path) => path.slice(0, path.lastIndexOf("/") + 1));
+  const target = dirs.find((dir) => dir.includes("recovery-archive")) ?? `${process.cwd()}/recovery-archive/`;
+  mkdirSync(target, { recursive: true });
+  const path = `${target}copies-${new Date().toISOString().slice(0, 10)}.json`;
+  let existing: any = { rows: [] };
+  for (const other of archiveFiles()) {
+    // Файл, який пишемо, не читаємо як джерело — інакше архів подвоюється.
+    if (other === path) continue;
+    try {
+      const pack = JSON.parse(readFileSync(other, "utf8"));
+      if (Array.isArray(pack?.rows)) existing.rows.push(...pack.rows);
+    } catch {
+      // Зіпсований файл архіву не має зривати роботу.
+    }
+  }
+
+  const known = new Set(existing.rows.map((row: any) => String(row.id)));
+  let added = 0;
+  for (const copy of copies) {
+    // Копії, які самі прийшли з архіву, не рахую як нові.
+    if (known.has(copy.id) || copy.archived) continue;
+    existing.rows.push({
+      id: copy.id,
+      site_order: copy.site_order,
+      paid: copy.paid,
+      total: copy.total,
+      date: copy.date,
+      fresh: Boolean(copy.fresh),
+      gateway_status: null,
+    });
+    known.add(copy.id);
+    added += 1;
+  }
+
+  existing.rows.sort((a: any, b: any) => (Number(a.date) || 0) - (Number(b.date) || 0));
+  existing.updated_at = Date.now();
+  writeFileSync(path, JSON.stringify(existing));
+  const paid = existing.rows.filter((row: any) => row.paid).length;
+  console.log(`архів: додано ${added}, всього ${existing.rows.length} (оплачених ${paid})`);
+  console.log(`файл: ${path}`);
+}
+
 function loadCopies(): OrderCopy[] {
   const pack = JSON.parse(readFileSync(PACK_PATH, "utf8"));
   return (pack.rows as OrderCopy[])
@@ -235,17 +296,29 @@ export function normalizeCopy(order: any): any {
  */
 async function scanCrmCards(sinceIso: string): Promise<CrmCard[]> {
   const cards: CrmCard[] = [];
+  // CRM дозволяє саме цей фільтр; created_at вона відхиляє.
+  const from = sinceIso.replace("T", " ").replace(".000Z", "");
+  const to = new Date().toISOString().replace("T", " ").replace(/\.\d+Z$/, "");
+  let total = 0;
 
   for (let page = 1; page <= CARD_SCAN_MAX_PAGES; page++) {
     const response: any = await api.pipelines.getPaginatedListOfPipelinesCards({
       limit: CARD_SCAN_PAGE,
       page,
       include: "contact.client,status",
-      filter: { created_at: `from ${sinceIso}` },
+      filter: { created_between: `${from},${to}`, source_id: ORDER_SOURCE_ID },
     });
-    if (isCrmRejection(response)) {
-      // Обірвана звірка — це не порожній CRM: не можна вважати, що карток немає.
-      throw new Error(`звірка з CRM обірвалася на сторінці ${page}: ${String(response?.message ?? "відмова")}`);
+    // Будь-яка відмова або дивна відповідь — це не порожній CRM:
+    // вважати, що карток немає, означає створити дублі.
+    if (isCrmRejection(response) || response?.message || !Array.isArray(response?.data)) {
+      throw new Error(
+        `звірка з CRM обірвалася на сторінці ${page}: ${String(response?.message ?? "незрозуміла відповідь")}`,
+      );
+    }
+    if (page === 1) {
+      total = Number(response?.total) || 0;
+      if (total <= 0) throw new Error("звірка з CRM повернула 0 карток за період — це ознака збою, а не порожнього CRM");
+      console.log(`у CRM за період карток: ${total}`);
     }
     const batch: any[] = Array.isArray(response?.data) ? response.data : [];
     const oldest = batch.at(-1)?.created_at;
@@ -260,7 +333,7 @@ async function scanCrmCards(sinceIso: string): Promise<CrmCard[]> {
       cards.push({
         id: String(card.id),
         source_uuid: card.source_uuid != null ? String(card.source_uuid) : null,
-        is_order: String(card.target_type ?? "").toLowerCase() === "order",
+        is_order: isOrderCard(card),
         status_id: Number(card.status_id) || 0,
         phone: phoneDigits(card.contact?.phone ?? card.contact?.client?.phone),
         email: String(card.contact?.email ?? card.contact?.client?.email ?? "").trim().toLowerCase(),
@@ -279,6 +352,19 @@ async function scanCrmCards(sinceIso: string): Promise<CrmCard[]> {
 /** Телефон у вигляді цифр для порівняння — без будь-яких перетворень. */
 function phoneDigits(value: unknown): string {
   return String(value ?? "").replace(/\D/g, "");
+}
+
+/**
+ * Картка стала замовленням чи лишилася лідом.
+ * Поля target_type CRM у списку не віддає, тому дивлюся на заголовок
+ * («Замовлення #381294») і на наявність товарів.
+ */
+function isOrderCard(card: any): boolean {
+  const byType = String(card?.target_type ?? "").toLowerCase();
+  if (byType === "order") return true;
+  if (byType) return false;
+  if (Number(card?.source_id) === ORDER_SOURCE_ID) return true;
+  return /^замовлення\s*#\s*\d+/i.test(String(card?.title ?? "").trim());
 }
 
 /** Чи ця картка за нашим номером: за номером сайту, номером замовлення, телефоном або поштою. */
@@ -325,27 +411,52 @@ export function hasDeliverableAddress(order: any): boolean {
  * Запит іноді не відповідає взагалі (обмеження темпу, збій мережі).
  * Тоді повертаємо «не знаю»: творити картку в такому стані — прямий шлях до дубля.
  */
-async function findCard(sourceUuid: string): Promise<{ id: string } | "unknown" | null> {
-  let lastError = "CRM не відповіла";
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    try {
-      const res: any = await api.order.getOrdersBySourceUuid(sourceUuid);
-      if (isCrmRejection(res)) {
-        lastError = String(res?.message ?? "відмова CRM");
-      } else if (Array.isArray(res?.data) || Array.isArray(res)) {
-        const list: any[] = Array.isArray(res?.data) ? res.data : res;
-        const match = list.find((order) => String(order?.source_uuid) === String(sourceUuid));
-        return match?.id ? { id: String(match.id) } : null;
-      } else {
-        lastError = String(res?.message ?? "незрозуміла відповідь CRM");
-      }
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
+/**
+ * Чи картка вже є — за списком замовлень CRM за період.
+ * Саме замовлення (на відміну від карток воронки) віддають source_uuid —
+ * тобто номер замовлення сайту, і це точна ознака, а не збіг телефону.
+ * Список знімається один раз і перевикористовується.
+ */
+async function loadCrmOrders(): Promise<void> {
+  if (orderUuids.size > 0) return;
+  const from = new Date(SINCE_MS).toISOString().replace("T", " ").replace(/\.\d+Z$/, "");
+  const to = new Date(Date.now() + 86400000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "");
+
+  for (let page = 1; page <= ORDER_SCAN_MAX_PAGES; page++) {
+    const res: any = await api.order.listOrdersPage({
+      limit: ORDER_SCAN_PAGE,
+      page,
+      createdBetween: `${from},${to}`,
+    });
+    // Мовчазна відмова тут означала б «карток немає» і дублі — краще спинитися.
+    if (isCrmRejection(res) || res?.message || !Array.isArray(res?.data)) {
+      throw new Error(
+        `звірка замовлень обірвалася на сторінці ${page}: ${String(res?.message ?? "незрозуміла відповідь")}`,
+      );
     }
-    await sleep(REQUEST_PAUSE_MS * attempt * 4);
+    if (page === 1) {
+      const total = Number(res?.total) || 0;
+      if (total <= 0) throw new Error("звірка замовлень у CRM повернула 0 — це збій, а не порожній CRM");
+      console.log(`у CRM за період замовлень: ${total}`);
+    }
+    for (const order of res.data) {
+      const uuid = order?.source_uuid;
+      const cardId = order?.id ?? order?.card_id;
+      if (uuid != null && cardId != null) orderUuids.set(String(Number(uuid)), String(cardId));
+    }
+    if (res.data.length < ORDER_SCAN_PAGE) break;
   }
-  console.log(`  ${sourceUuid}: стан невідомий (${lastError.slice(0, 60)}) — картку не творю`);
-  return "unknown";
+}
+
+async function findCard(sourceUuid: string): Promise<{ id: string } | "unknown" | null> {
+  try {
+    await loadCrmOrders();
+  } catch (error) {
+    console.log(`  ${sourceUuid}: стан невідомий (${String(error).slice(0, 60)}) — картку не творю`);
+    return "unknown";
+  }
+  const cardId = orderUuids.get(String(Number(sourceUuid)));
+  return cardId ? { id: cardId } : null;
 }
 
 /** Знімає дубль ліда в статус 45 — без цього CRM відмовляє створювати оплачене замовлення. */
@@ -464,17 +575,18 @@ async function processOne(copy: OrderCopy, live: boolean, cards: CrmCard[]): Pro
     return { ...base, state: "skipped", card_id: null, note: validation.errors.join(", ") };
   }
 
-  // Прохід 1 — звірка за вже знятим списком карток: жодного запиту на замовлення.
+  // Прохід 1 — звірка за списком замовлень CRM: жодного запиту на замовлення.
+  const scanned = orderUuids.get(String(Number(copy.id)));
   const { order: knownOrder, lead: knownLead } = matchCards(cards, copy.id, order);
-
-  if (knownOrder) {
+  const existingId = scanned ?? knownOrder?.id ?? null;
+  if (existingId) {
     const shouldPay = Number(order.paymentStatus) === 1;
-    if (!live || !shouldPay) return { ...base, state: "exists", card_id: knownOrder.id, note: "картка вже є" };
-    const paid = await markPaid(knownOrder.id);
+    if (!live || !shouldPay) return { ...base, state: "exists", card_id: existingId, note: "картка вже є" };
+    const paid = await markPaid(existingId);
     return {
       ...base,
       state: "paid_only",
-      card_id: knownOrder.id,
+      card_id: existingId,
       note: paid ? "оплату позначено" : "номер є, оплату позначити не вдалося",
     };
   }
@@ -592,7 +704,13 @@ function printReport(): void {
 
 async function main() {
   const args = Bun.argv.slice(2);
-  const mode = args.includes("check") ? "check" : args.includes("report") ? "report" : "send";
+  const mode = args.includes("check")
+    ? "check"
+    : args.includes("report")
+      ? "report"
+      : args.includes("archive")
+        ? "archive"
+        : "send";
   const live = args.includes("--live");
   const paidOnly = !args.includes("--all");
   const limitArg = args.find((arg) => /^--limit=\d+$/.test(arg));
@@ -612,6 +730,14 @@ async function main() {
   });
 
   const pulled = await pullCopies();
+
+  // Шлюз тримає ~995 записів і витісняє старі щодня, тому архів треба
+  // надолужувати тим, що встигли зняти: інакше витіснене зникає назавжди.
+  if (mode === "archive") {
+    mergeIntoArchive(pulled);
+    return;
+  }
+
   let copies = pulled;
   if (paidOnly) copies = copies.filter((copy) => copy.paid);
   if (idsArg) {
@@ -631,16 +757,19 @@ async function main() {
     `режим: ${mode}${live ? " (жива відправка)" : " (без записів)"} | замовлень: ${copies.length} на ${Math.round(total)} грн`,
   );
 
-  // Одна звірка замість запиту на кожне замовлення — так витрата квоти в межах норми.
+  // Звірка одним списком: замовлення CRM віддають source_uuid — точна відповідь.
   const sinceIso = new Date(SINCE_MS).toISOString().slice(0, 10);
-  console.log(`звірка з CRM: беру картки з ${sinceIso} по ${CARD_SCAN_PAGE} за запит…`);
-  const cards = await scanCrmCards(sinceIso);
-  console.log(`у CRM за період карток: ${cards.length} (замовлень: ${cards.filter((c) => c.is_order).length})`);
+  console.log(`звірка з CRM: беру замовлення з ${sinceIso} по ${ORDER_SCAN_PAGE} за запит…`);
+  await loadCrmOrders();
+  console.log(
+    `з них картка вже є: ${copies.filter((c) => orderUuids.has(String(Number(c.id)))).length} із ${copies.length}`,
+  );
+
+  // Ліди та дублі — окремою звіркою карток воронки (за прапорцем --cards).
+  const cards: CrmCard[] = args.includes("--cards") ? await scanCrmCards(sinceIso) : [];
 
   // Знімок «що вже було» — щоб підсумковий звіт рахував було/створено без повторної звірки.
-  const hadBefore = copies
-    .filter((copy) => matchCards(cards, copy.id, normalizeCopy(copy.site_order)).order !== null)
-    .map((copy) => copy.id);
+  const hadBefore = copies.filter((copy) => orderUuids.has(String(Number(copy.id)))).map((copy) => copy.id);
   writeFileSync(CRM_BEFORE_PATH, JSON.stringify({ updated: Date.now(), ids: hadBefore }));
   console.log(`з них картка вже є: ${hadBefore.length} із ${copies.length}`);
 

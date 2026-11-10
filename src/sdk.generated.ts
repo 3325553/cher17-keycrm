@@ -963,6 +963,17 @@ export class OrderService {
       undefined,
     );
   }
+  /** Список замовлень сторінками за період створення — для звірки «чи є картка». */
+  async listOrdersPage(params: {
+    limit: number;
+    page: number;
+    createdBetween: string;
+  }): Promise<Record<string, any>> {
+    const query =
+      `limit=${params.limit}&page=${params.page}` +
+      `&filter%5Bcreated_between%5D=${encodeURIComponent(params.createdBetween)}`;
+    return this.client.request("GET", `/order?${query}`, undefined);
+  }
   async getOrdersBySourceUuid(sourceUuid: string): Promise<Record<string, any>> {
     const q = encodeURIComponent(sourceUuid);
     // CRM ігнорує параметр source_uuid без filter[] і віддає останні замовлення,
