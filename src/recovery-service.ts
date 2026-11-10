@@ -1,7 +1,7 @@
 import redis from "./redis";
 import { CONFIG, REDIS_KEYS } from "./config";
 import type { SiteOrder, OrderMapping } from "./types";
-import { addStatusToHistory, getOrderMapping } from "./order-mapping-service";
+import { addStatusToHistory, createOrUpdateOrderMapping, getOrderMapping } from "./order-mapping-service";
 import { enqueueDelayed } from "./delayed-queue";
 import { formatDateTimeKyiv, validateSiteOrder } from "./utils";
 import {
@@ -197,6 +197,10 @@ function pickPayload(preferred: SiteOrder | null, fallback: SiteOrder | null): S
   const preferredPaid = Number(preferred.paymentStatus) === 1;
   const fallbackPaid = Number(fallback.paymentStatus) === 1;
   if (preferredPaid !== fallbackPaid) return preferredPaid ? preferred : fallback;
+  // Скорочена картка (без товарів) не може замінити повну копію: з неї не створити картку.
+  const preferredUsable = Boolean(preferred.items?.length);
+  const fallbackUsable = Boolean(fallback.items?.length);
+  if (preferredUsable !== fallbackUsable) return preferredUsable ? preferred : fallback;
   return preferred;
 }
 
@@ -589,6 +593,11 @@ export type ReplayOptions = {
   paceSec?: number;
   force?: boolean;
   dryRun?: boolean;
+  /**
+   * Повні копії замовлень, зняті зі шлюзу. Потрібні тоді, коли в пам'яті
+   * лишилися лише скорочені картки, а створювати картку треба з товарами.
+   */
+  payloads?: Array<{ id: string; site_order: SiteOrder }>;
 };
 
 export type ReplayPlanItem = {
@@ -674,13 +683,73 @@ export async function replayOrders(options: ReplayOptions = {}): Promise<ReplayR
   }
 }
 
+type SanityIssue = { field: string; message: string };
+
+/**
+ * Копії з сайту іноді приходять із розбіжністю суми.
+ * Найчастіше сума замовлення нульова (знижка дорівнює вартості товарів),
+ * тоді як позиції мають ціни. Таку копію CRM відхиляє — і замовлення висить.
+ * Беручи суму з позицій, ми не змінюємо товари й не вигадуємо цін:
+ * у картці буде та ж сума, що й на сайті в позиціях.
+ */
+function repairSiteOrderCopy(order: SiteOrder): { order: SiteOrder; repaired: SanityIssue[] } {
+  const repaired: SanityIssue[] = [];
+  const items = order.items ?? [];
+
+  if ((Number(order.totalCost) || 0) <= 0 && items.length > 0) {
+    const fromItems = items.reduce(
+      (acc, item) => acc + (Number(item.cost) || 0) * (Number(item.quantity) || 0),
+      0,
+    );
+    if (fromItems > 0) {
+      const discount = Number(order.discount) || 0;
+      // Знижка, що дорівнює вартості кошика, перетворює суму в нуль. Прибираємо саме її,
+      // бо інакше сума в картці й сума позицій розійдуться.
+      const discountToZero = discount >= fromItems;
+      repaired.push({
+        field: discountToZero && discount > 0 ? "discount" : "totalCost",
+        message: discountToZero && discount > 0
+          ? `Знайдено знижку ${discount} при копії всього кошика ${fromItems} — знижку прибрано`
+          : `Було ${Number(order.totalCost) || 0}, взято з позицій ${fromItems}`,
+      });
+      return {
+        order: discountToZero
+          ? { ...order, discount: 0, totalCost: fromItems }
+          : { ...order, totalCost: fromItems },
+        repaired,
+      };
+    }
+  }
+
+  return { order, repaired };
+}
+
+function normalizeCopy(order: SiteOrder): SiteOrder {
+  const discount = Number(order.discount);
+  return {
+    ...order,
+    discount: order.discount && Number.isFinite(discount) ? discount : 0,
+  };
+}
+
 async function buildReplay(options: ReplayOptions): Promise<ReplayReport> {
   const dryRun = options.dryRun !== false;
   const force = options.force === true;
   const paceSec = Math.max(3, Math.min(Number(options.paceSec ?? CONFIG.REPLAY_PACE_SEC) || CONFIG.REPLAY_PACE_SEC, 120));
   const batchLimit = Math.max(1, Math.min(Number(options.limit ?? CONFIG.REPLAY_MAX_BATCH) || CONFIG.REPLAY_MAX_BATCH, CONFIG.REPLAY_MAX_BATCH));
 
+  const supplied = new Map<string, SiteOrder>();
+  for (const entry of options.payloads ?? []) {
+    const order = normalizeCopy(entry.site_order);
+    supplied.set(String(entry.id ?? order.externalOrderId), order);
+  }
+
   const { candidates } = await collectCandidates();
+  for (const [id, order] of supplied) {
+    const candidate = ensureCandidate(candidates, id);
+    candidate.sources.add("pack");
+    candidate.order = pickPayload(order, candidate.order);
+  }
   const delayedBefore = Number(await redis.zcard(REDIS_KEYS.DELAYED_QUEUE)) || 0;
 
   const requestedIds = options.ids?.length
@@ -709,7 +778,12 @@ async function buildReplay(options: ReplayOptions): Promise<ReplayReport> {
       continue;
     }
 
-    const site = pickPayload(mapping?.site_order ?? null, candidate?.order ?? null);
+    // поставлений пакет (повна копія) важливіший за все, що лежить у чергах,
+    // а найсвіжіша копія сайту в мапінгу — за старий пакет
+    const site = pickPayload(
+      mapping?.site_order ?? null,
+      supplied.get(id) ?? candidate?.order ?? null,
+    );
     if (!site) {
       skipped.push({
         id, paid: false, total: 0, order_status: null, date_kyiv: null, run_at: null,
@@ -721,11 +795,13 @@ async function buildReplay(options: ReplayOptions): Promise<ReplayReport> {
     considered += 1;
     const paid = Number(site.paymentStatus) === 1;
     const date = toMs(site.date);
+    // Виправлення робимо до підрахунку, щоб у плані й звіті була та сума, яка піде в CRM.
+    const sanity = repairSiteOrderCopy(site);
     const base: ReplayPlanItem = {
       id,
       paid,
-      total: Number(site.totalCost ?? 0) || 0,
-      order_status: Number(site.orderStatus ?? 0),
+      total: Number(sanity.order.totalCost ?? 0) || 0,
+      order_status: Number(sanity.order.orderStatus ?? 0),
       date_kyiv: kyivDay(date),
       run_at: null,
       reason: "",
@@ -744,10 +820,13 @@ async function buildReplay(options: ReplayOptions): Promise<ReplayReport> {
       continue;
     }
 
-    const validation = validateSiteOrder(site);
+    const validation = validateSiteOrder(sanity.order);
     if (!validation.isValid) {
       skipped.push({ ...base, reason: `копія не проходить перевірку: ${validation.errors.join(", ")}` });
       continue;
+    }
+    if (sanity.repaired.length > 0) {
+      base.reason = `виправлено копію: ${sanity.repaired.map((issue) => issue.message).join("; ")}`;
     }
 
     const knownCardId = await recoverKnownCardId(id, mapping, !dryRun);
@@ -758,13 +837,22 @@ async function buildReplay(options: ReplayOptions): Promise<ReplayReport> {
         skipped.push({ ...base, reason: `картка вже є (${knownCardId})${paidSynced ? ", оплату позначено" : ""}` });
         continue;
       }
-      chosen.push({ id, site, candidate: candidate ?? ensureCandidate(candidates, id) });
-      scheduled.push({ ...base, reason: `картка є (${knownCardId}), треба позначити оплату` });
+      chosen.push({ id, site: sanity.order, candidate: candidate ?? ensureCandidate(candidates, id) });
+      scheduled.push({
+        ...base,
+        reason: [base.reason, `картка є (${knownCardId}), треба позначити оплату`].filter(Boolean).join("; "),
+      });
       continue;
     }
 
-    chosen.push({ id, site, candidate: candidate ?? ensureCandidate(candidates, id) });
-    scheduled.push({ ...base, reason: knownCardId ? `примусово, картка ${knownCardId}` : "картки немає, створити" });
+    chosen.push({ id, site: sanity.order, candidate: candidate ?? ensureCandidate(candidates, id) });
+    scheduled.push({
+      ...base,
+      reason: [
+        base.reason,
+        knownCardId ? `примусово, картка ${knownCardId}` : "картки немає, створити",
+      ].filter(Boolean).join("; "),
+    });
   }
 
   // Хронологічний порядок: спершу найстаріші гроші.
@@ -810,13 +898,15 @@ async function buildReplay(options: ReplayOptions): Promise<ReplayReport> {
 
     await clearStaleGuards(item.id);
     await enqueueDelayed(REDIS_KEYS.DELAYED_QUEUE, JSON.stringify(item.site), runAt);
+    // Свіжу копію кладемо й у мапінг: воркер бере її як основне джерело даних.
+    await createOrUpdateOrderMapping(item.site, "pending");
     await addStatusToHistory(item.id, "retry_scheduled", {
       message: `Повторна відправка зі збереженої копії: позиція ${position + 1}/${batch.length}, через ${Math.round((runAt - Date.now()) / 1000)} с.`,
     });
   }
 
   const selectedTotal = Math.round(planItems.reduce((acc, item) => acc + item.total, 0) * 100) / 100;
-  const estimatedRequests = planItems.reduce((acc, item) => acc + (item.reason.startsWith("картка є") ? 3 : 10), 0);
+  const estimatedRequests = planItems.reduce((acc, item) => acc + (item.reason.includes("картка є") ? 3 : 10), 0);
 
   return {
     dry_run: dryRun,

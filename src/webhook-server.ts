@@ -548,6 +548,12 @@ export function createWebhookServer() {
           paceSec: body.paceSec,
           force: body.force,
           dryRun: body.dryRun,
+          payloads: body.payloads?.map((entry) => ({
+            id: entry.id,
+            site_order: typeof entry.site_order === "string"
+              ? JSON.parse(entry.site_order)
+              : entry.site_order,
+          })),
         });
         return { success: true, ...report };
       } catch (error) {
@@ -568,6 +574,15 @@ export function createWebhookServer() {
         paceSec: t.Optional(t.Number()),
         force: t.Optional(t.Boolean()),
         dryRun: t.Optional(t.Boolean()),
+        // Повні копії замовлень (або рядок JSON) — коли в пам'яті лишилися лише скорочені картки.
+        payloads: t.Optional(
+          t.Array(
+            t.Object({
+              id: t.String(),
+              site_order: t.Union([t.String(), t.Record(t.String(), t.Any())]),
+            }),
+          ),
+        ),
       }),
     })
     .get("/styles.css", ({ headers, set }) => {

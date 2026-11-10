@@ -502,6 +502,55 @@ describe("знімок і повторна звірка", () => {
   });
 });
 
+describe("відправка з повної копії (пакет)", () => {
+  test("скорочена копія в пам'яті заміщується поставленою повною і стає в чергу", async () => {
+    // у пам'яті лишилася лише скорочена картка без товарів
+    await createOrUpdateOrderMapping(siteOrder("900040", { items: [], totalCost: 0 }), "failed");
+
+    const full = siteOrder("900040", { totalCost: 1200 });
+    const report = await replayOrders({ ids: ["900040"], payloads: [{ id: "900040", site_order: full }], dryRun: false });
+
+    expect(report.selected).toBe(1);
+    expect(report.scheduled[0]?.reason).toContain("картки немає");
+
+    const queued = await fakeRedis.zrange(REDIS_KEYS.DELAYED_QUEUE, 0, -1) as string[];
+    expect(queued.length).toBe(1);
+    const payload = JSON.parse(queued[0]!);
+    expect(payload.items.length).toBe(1);
+    expect(payload.totalCost).toBe(1200);
+
+    // мапінг перезаписано повною копією, інакше воркер знову візьме порожню
+    const mapping = await getOrderMapping("900040");
+    expect(mapping?.site_order?.items?.length).toBe(1);
+    expect(mapping?.current_status).toBe("pending");
+  });
+
+  test("нульова сума береться з позицій, а не відкидається", async () => {
+    const broken = siteOrder("900041", {
+      totalCost: 0,
+      discount: 1200,
+      items: [{ name: "Товар", quantity: 1, cost: 1200 }],
+    });
+    await createOrUpdateOrderMapping(broken, "failed");
+
+    const report = await replayOrders({ ids: ["900041"], dryRun: false });
+    expect(report.selected).toBe(1);
+    expect(report.scheduled[0]?.total).toBe(1200);
+
+    const queued = await fakeRedis.zrange(REDIS_KEYS.DELAYED_QUEUE, 0, -1) as string[];
+    expect(JSON.parse(queued[0]!).totalCost).toBe(1200);
+  });
+
+  test("копія без товарів і без суми відкладається, а не відправляється навмання", async () => {
+    await createOrUpdateOrderMapping(siteOrder("900042", { items: [], totalCost: 0 }), "failed");
+
+    const report = await replayOrders({ ids: ["900042"], dryRun: false });
+    expect(report.selected).toBe(0);
+    expect(report.skipped[0]?.reason).toContain("не проходить перевірку");
+    expect((await fakeRedis.zrange(REDIS_KEYS.DELAYED_QUEUE, 0, -1) as string[]).length).toBe(0);
+  });
+});
+
 describe("звірка з CRM", () => {
   test("порожній список означає «картки немає», а відмова — «невідомо»", async () => {
     const order = siteOrder("900020");
