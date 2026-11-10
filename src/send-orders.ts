@@ -41,7 +41,7 @@ type OrderCopy = {
 type Outcome = {
   id: string;
   total: number;
-  state: "exists" | "created" | "paid_only" | "skipped" | "failed" | "unknown";
+  state: "exists" | "created" | "paid_only" | "skipped" | "failed" | "unknown" | "lead_only";
   card_id: string | null;
   note: string;
 };
@@ -215,6 +215,47 @@ async function createCard(order: any): Promise<string> {
   throw new Error(lastError);
 }
 
+/**
+ * Замовлення могло потрапити в CRM лише як картка воронки (лід).
+ * Тоді замовлення «не існує», хоча картка є — і CRM його більше не прийме.
+ * Знаходимо таку картку за номером замовлення, телефоном або поштою.
+ */
+async function findLeadCard(order: any): Promise<{ id: string; status_id: number } | null> {
+  const orderRef = String(order.externalOrderId).toLowerCase();
+  const targetPhone = formatPhoneNumber(String(order.phone ?? "")).replace(/\D/g, "");
+  const targetEmail = String(order.email ?? "").trim().toLowerCase();
+
+  for (let page = 1; page <= LEAD_SEARCH_MAX_PAGES; page++) {
+    const response: any = await api.pipelines.getPaginatedListOfPipelinesCards({
+      limit: LEAD_SEARCH_PAGE_SIZE,
+      page,
+      include: "contact.client,status",
+    });
+    if (isCrmRejection(response)) return null;
+    const cards: any[] = Array.isArray(response?.data) ? response.data : [];
+    if (cards.length === 0) return null;
+
+    const match = cards.find((card: any) => {
+      if (!card || card.id == null) return false;
+      if (String(card.target_type ?? "").toLowerCase() === "order") return false;
+      const title = String(card.title ?? "").toLowerCase();
+      const comment = String(card.manager_comment ?? "").toLowerCase();
+      const byOrderRef = title.includes(orderRef) || comment.includes(orderRef);
+      const cardPhone = formatPhoneNumber(String(card.contact?.phone ?? card.contact?.client?.phone ?? "")).replace(/\D/g, "");
+      const cardEmail = String(card.contact?.email ?? card.contact?.client?.email ?? "").trim().toLowerCase();
+      return (
+        byOrderRef ||
+        (targetPhone.length > 0 && cardPhone === targetPhone) ||
+        (targetEmail.length > 0 && cardEmail === targetEmail)
+      );
+    });
+
+    if (match) return { id: String(match.id), status_id: Number(match.status_id) };
+    if (cards.length < LEAD_SEARCH_PAGE_SIZE) return null;
+  }
+  return null;
+}
+
 async function processOne(copy: OrderCopy, live: boolean): Promise<Outcome> {
   const order = normalizeCopy(copy.site_order);
   const base = { id: copy.id, total: Number(order.totalCost) || 0 };
@@ -241,9 +282,31 @@ async function processOne(copy: OrderCopy, live: boolean): Promise<Outcome> {
     return { ...base, state: "exists", card_id: card, note: "картка вже є" };
   }
 
-  if (!live) return { ...base, state: "created", card_id: null, note: "картки немає — буде створено" };
+  // Копія могла осісти в CRM лише лідом: замовлення тоді не існує, а повтор відхиляється.
+  let lead: { id: string; status_id: number } | null = null;
+  try {
+    lead = await findLeadCard(order);
+  } catch {
+    lead = null;
+  }
+
+  if (!live) {
+    return lead
+      ? { ...base, state: "exists", card_id: null, note: `є лише лід ${lead.id} — буде переведено в замовлення` }
+      : { ...base, state: "created", card_id: null, note: "картки немає — буде створено" };
+  }
+
+  if (lead && lead.status_id === DUPLICATE_LEAD_STATUS_ID) {
+    return {
+      ...base,
+      state: "lead_only",
+      card_id: lead.id,
+      note: "лід позначено як дубль — творення замовлення може відхилятися, потрібен ручний розбір",
+    };
+  }
 
   try {
+    // Оплачене замовлення знімає дубль-лід у 45: інакше CRM вважає його дублем.
     if (Number(order.paymentStatus) === 1) await moveDuplicateLeadToPaidStatus(order);
     const created = await createCard(order);
     let note = "створено";
@@ -252,7 +315,7 @@ async function processOne(copy: OrderCopy, live: boolean): Promise<Outcome> {
     }
     return { ...base, state: "created", card_id: created, note };
   } catch (error) {
-    return { ...base, state: "failed", card_id: null, note: String(error).slice(0, 120) };
+    return { ...base, state: "failed", card_id: lead?.id ?? null, note: String(error).slice(0, 120) };
   }
 }
 
