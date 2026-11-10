@@ -4,6 +4,7 @@ import type { SiteOrder, OrderMapping } from "./types";
 import { enqueueOrder } from "./queue-service";
 import {
   collectBacklog,
+  buildSnapshot,
   backlogToCsv,
   checkOrders,
   replayOrders,
@@ -446,8 +447,9 @@ export function createWebhookServer() {
       server?.timeout(request, 255);
 
       try {
-        const report = await collectBacklog({
-          paidOnly: query.paid === "1",
+        const collect = query.mode === "snapshot" ? buildSnapshot : collectBacklog;
+        const report = await collect({
+          paidOnly: query.mode === "snapshot" ? false : query.paid === "1",
           includeKnown: query.known === "1",
           since: parseDateParam(query.since),
           until: parseDateParam(query.until, true),
@@ -476,6 +478,7 @@ export function createWebhookServer() {
         until: t.Optional(t.String()),
         limit: t.Optional(t.String()),
         format: t.Optional(t.String()),
+        mode: t.Optional(t.String()),
       }),
     })
     .post("/check", async ({ headers, body, set, server, request }) => {
@@ -492,6 +495,7 @@ export function createWebhookServer() {
         const result = await checkOrders(body.ids, {
           crm: body.crm === true,
           repair: body.repair === true,
+          useCache: body.useCache === true,
         });
 
         const withCrm = result.results.filter((item) => item.crm_check);
@@ -522,6 +526,7 @@ export function createWebhookServer() {
         ids: t.Array(t.String()),
         crm: t.Optional(t.Boolean()),
         repair: t.Optional(t.Boolean()),
+        useCache: t.Optional(t.Boolean()),
       }),
     })
     .post("/replay", async ({ headers, body, set, server, request }) => {

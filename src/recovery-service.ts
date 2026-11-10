@@ -1,7 +1,7 @@
 import redis from "./redis";
 import { CONFIG, REDIS_KEYS } from "./config";
 import type { SiteOrder, OrderMapping } from "./types";
-import { addStatusToHistory } from "./order-mapping-service";
+import { addStatusToHistory, getOrderMapping } from "./order-mapping-service";
 import { enqueueDelayed } from "./delayed-queue";
 import { formatDateTimeKyiv, validateSiteOrder } from "./utils";
 import {
@@ -29,6 +29,19 @@ const SITE_STATUSES = [0, 1, 2, 3];
 
 let scanInProgress = false;
 
+/**
+ * Номери, які нещодавно перевіряли в CRM, уже знаються на шлюзі.
+ * Невеликий кеш прибирає повторні запити до ключа, який має спільний ліміт.
+ */
+const recentChecks = new Map<string, { at: number; result: CheckCacheEntry }>();
+const RECENT_CHECK_TTL_MS = 30 * 60 * 1000;
+
+type CheckCacheEntry = {
+  state: "exists" | "absent" | "unknown";
+  crm_id: string | null;
+  error?: string;
+};
+
 export type BacklogEntry = {
   id: string;
   paid: boolean;
@@ -45,6 +58,9 @@ export type BacklogEntry = {
   sources: string[];
   has_payload: boolean;
   updated_at: number | null;
+  /** Остання перевірка цього номера в самій CRM (якщо вже робилася). */
+  crm_state?: "exists" | "absent" | "unknown";
+  crm_id?: string | null;
 };
 
 export type BacklogReport = {
@@ -372,6 +388,7 @@ export async function collectBacklog(options: BacklogOptions = {}): Promise<Back
       const site = pickPayload(mapping?.site_order ?? null, candidate.order);
       const date = toMs(site?.date);
       const updatedAt = mapping?.updated_at ?? candidate.dlqFailedAt ?? null;
+      const recent = recentChecks.get(id);
 
       return {
         id,
@@ -389,6 +406,8 @@ export async function collectBacklog(options: BacklogOptions = {}): Promise<Back
         sources: [...candidate.sources].sort(),
         has_payload: Boolean(site),
         updated_at: updatedAt,
+        crm_state: recent?.result.state,
+        crm_id: recent?.result.crm_id ?? null,
       };
     });
 
@@ -467,13 +486,20 @@ export type CheckResult = {
   };
 };
 
+export type CheckOptions = {
+  crm?: boolean;
+  repair?: boolean;
+  /** Не питати CRM повторно, якщо цей номер уже перевіряли нещодавно. */
+  useCache?: boolean;
+};
+
 /**
  * Звірка номерів із самою CRM. Один запит на номер, тому пакет обмежений.
  * repair=true додатково відновлює загублений зв'язок «сайт ↔ картка».
  */
 export async function checkOrders(
   ids: string[],
-  options: { crm?: boolean; repair?: boolean } = {},
+  options: CheckOptions = {},
 ): Promise<{ checked: number; results: CheckResult[]; truncated: boolean }> {
   const unique = [...new Set(ids.map((id) => String(id).trim()).filter(Boolean))];
   const cap = options.crm ? CONFIG.CHECK_MAX_BATCH : 1000;
@@ -499,8 +525,19 @@ export async function checkOrders(
     };
 
     if (options.crm) {
+      const cached = options.useCache ? recentChecks.get(id) : undefined;
       try {
-        const found = await findExistingCrmOrderIdBySourceUuid(id);
+        let found: string | null;
+        if (cached && Date.now() - cached.at < RECENT_CHECK_TTL_MS && cached.result.state !== "unknown") {
+          found = cached.result.crm_id;
+        } else {
+          found = await findExistingCrmOrderIdBySourceUuid(id);
+          recentChecks.set(id, {
+            at: Date.now(),
+            result: { state: found ? "exists" : "absent", crm_id: found },
+          });
+        }
+
         result.crm_check = {
           state: found ? "exists" : "absent",
           crm_id: found,
@@ -516,10 +553,15 @@ export async function checkOrders(
           result.crm_check.repaired = true;
         }
       } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        recentChecks.set(id, {
+          at: Date.now(),
+          result: { state: "unknown", crm_id: null, error: message },
+        });
         result.crm_check = {
           state: "unknown",
           crm_id: null,
-          error: error instanceof Error ? error.message : String(error),
+          error: message,
         };
       }
     }
@@ -528,6 +570,14 @@ export async function checkOrders(
   });
 
   return { checked: results.length, results, truncated: unique.length > selected.length };
+}
+
+/**
+ * Знімок для зовнішньої звірки: усі замовлення в періоді, незалежно від того,
+ * чи шлюз вважає їх обробленими, плюс остання перевірка в CRM, якщо вона вже була.
+ */
+export async function buildSnapshot(options: BacklogOptions = {}): Promise<BacklogReport> {
+  return collectBacklog({ ...options, includeKnown: true });
 }
 
 export type ReplayOptions = {

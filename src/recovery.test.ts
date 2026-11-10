@@ -181,7 +181,7 @@ const fakeRedis = {
 mock.module("./redis", () => ({ default: fakeRedis }));
 
 const { REDIS_KEYS } = await import("./config");
-const { collectBacklog, replayOrders, parseDateParam, checkOrders } = await import("./recovery-service");
+const { collectBacklog, buildSnapshot, replayOrders, parseDateParam, checkOrders } = await import("./recovery-service");
 const { processOrder } = await import("./queue-service");
 const { createOrUpdateOrderMapping, addStatusToHistory, getOrderMapping } = await import("./order-mapping-service");
 const { isCrmRejection } = await import("./crm-guard");
@@ -467,6 +467,38 @@ describe("відмова CRM — це не успіх", () => {
     expect(success).toBe(true);
     expect(fetchCalls.some((call) => call.method === "POST")).toBe(false);
     expect(await fakeRedis.get(REDIS_KEYS.ORDER_PAID_STATUS_SYNCED("900014"))).toBe("4");
+  });
+});
+
+describe("знімок і повторна звірка", () => {
+  test("знімок віддає і тих, кого шлюз вважає обробленими", async () => {
+    const paid = siteOrder("900030", { date: Date.parse("2026-11-04T10:00:00Z") });
+    await createOrUpdateOrderMapping(paid, "completed");
+    await fakeRedis.set(REDIS_KEYS.CRM_ORDER_ID("900030"), "42800");
+    await fakeRedis.set(REDIS_KEYS.ORDER_PAID_STATUS_SYNCED("900030"), "4");
+
+    const backlog = await collectBacklog();
+    expect(backlog.orders.length).toBe(0);
+
+    // Знімок потрібен саме для повної звірки: оброблені шлюзом теж у переліку.
+    const snapshot = await buildSnapshot();
+    expect(snapshot.orders.map((entry) => entry.id)).toEqual(["900030"]);
+    expect(snapshot.orders[0]?.paid).toBe(true);
+    expect(snapshot.orders[0]?.known_crm_id).toBe("42800");
+    expect(snapshot.orders[0]?.crm_state).toBeUndefined();
+  });
+
+  test("повторна звірка бере недавній результат і не смикає CRM двічі", async () => {
+    const order = siteOrder("900031");
+    await createOrUpdateOrderMapping(order, "failed");
+
+    await checkOrders(["900031"], { crm: true });
+    const callsAfterFirst = fetchCalls.length;
+    expect(callsAfterFirst).toBeGreaterThan(0);
+
+    const second = await checkOrders(["900031"], { crm: true, useCache: true });
+    expect(fetchCalls.length).toBe(callsAfterFirst);
+    expect(second.results[0]?.crm_check?.state).toBe("absent");
   });
 });
 
