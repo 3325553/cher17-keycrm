@@ -15,8 +15,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 PROJECT_DIR="$(pwd)"
-GATEWAY_URL="${GATEWAY_URL:-http://127.0.0.1:3000}"
+GATEWAY_URL="${GATEWAY_URL:-http://127.0.0.1:80}"
 PREV_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo "")"
+# Контейнер може відповідати не одразу після Recreated — даю йому час
+# і не вважаю одноразову тишу за падіння.
+HEALTH_TRIES="${HEALTH_TRIES:-45}"
 
 say() { printf '\n== %s ==\n' "$1"; }
 
@@ -29,15 +32,16 @@ echo "тепер на: $(git log --oneline -1)"
 say "2/5 Перебирання контейнера (це займає ~2-3 хвилини)"
 docker compose up -d --build
 
-say "3/5 Чекаю, поки шлюз відповість (до 90 с)"
-for i in $(seq 1 45); do
+say "3/5 Чекаю, поки шлюз відповість (до $((HEALTH_TRIES * 2)) с)"
+for i in $(seq 1 "$HEALTH_TRIES"); do
   if curl -sf -m 3 "$GATEWAY_URL/health" >/dev/null 2>&1; then
     echo "шлюз відповів на спробі $i"
     break
   fi
   sleep 2
-  if [ "$i" -eq 45 ]; then
-    echo "❌ шлюз не піднявся — повертаю попередню збірку"
+  if [ "$i" -eq "$HEALTH_TRIES" ]; then
+    echo "❌ шлюз не піднявся за $((HEALTH_TRIES * 2)) с — перевірте docker compose logs app"
+    echo "   і доступи за адресою $GATEWAY_URL/health"
     if [ -n "$PREV_COMMIT" ]; then
       git reset --hard "$PREV_COMMIT"
       docker compose up -d --build
