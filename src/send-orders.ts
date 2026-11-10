@@ -87,23 +87,34 @@ const SNAPSHOT_MS = 1794309840000;
  */
 const REPO_DIR = new URL("../recovery-archive/", import.meta.url).pathname;
 
+/**
+ * Архів може лежати і в репозиторії, і поруч зі зібраним файлом
+ * (на сервері збірка йде в /tmp). Переглядаю обидва місця — інакше
+ * старі копії тихо не долучаться.
+ */
 function archiveFiles(): string[] {
-  try {
-    return readdirSync(REPO_DIR)
-      .filter((name) => name.endsWith(".json"))
-      .sort()
-      .map((name) => REPO_DIR + name);
-  } catch {
-    return [];
+  const dirs = [REPO_DIR, `${process.cwd()}/recovery-archive/`, "/tmp/recovery-archive/"];
+  const found: string[] = [];
+  for (const dir of dirs) {
+    try {
+      for (const name of readdirSync(dir)) {
+        if (!name.endsWith(".json")) continue;
+        const path = dir + name;
+        if (!found.includes(path)) found.push(path);
+      }
+    } catch {
+      // Немає такої теки — просто пробую наступну.
+    }
   }
+  return found.sort();
 }
 
 async function gwGet(path: string): Promise<any> {
   const res = await fetch(GW + path, { headers: { Authorization: GW_AUTH } });
   if (res.ok) return res.json();
-  const cached = await Bun.file(PACK_PATH).exists();
-  if (!cached) throw new Error(`шлюз віддав HTTP ${res.status} на ${path}`);
-  return JSON.parse(await Bun.file(PACK_PATH).text());
+  // Ніколи не підставляю власний попередній вихід: застаріла копія,
+  // видана за свіжі дані шлюзу, може піти в CRM як дубль.
+  throw new Error(`шлюз віддав HTTP ${res.status} на ${path}`);
 }
 
 /**
