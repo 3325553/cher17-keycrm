@@ -15,7 +15,7 @@
  * Копії бере не з файлу, а з самого шлюзу: замовлення з 01.11, у яких є товари.
  * Так відправка працює одразу, без перезбирання і без передачі файлів.
  */
-import { existsSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "fs";
 import { SDK } from "./sdk.generated";
 import { convertSiteOrderToCRM, formatPhoneNumber, parseShippingAddress, validateSiteOrder } from "./utils";
 import { isCrmRejection, getCrmRequestRate } from "./crm-guard";
@@ -41,6 +41,8 @@ type OrderCopy = {
   date: number;
   /** Номер потрапив у шлюз уже після знімка — його не було в переліку.**/
   fresh?: boolean;
+  /** Копію збережено в архіві репозиторію — зі шлюзу її вже витіснили. */
+  archived?: boolean;
 };
 
 type Outcome = {
@@ -79,6 +81,22 @@ const SINCE_MS = Date.parse("2026-10-31T22:00:00Z");
  * Номери, що з'явилися в шлюзі пізніше, обробляємо незалежно від дати замовлення.
  */
 const SNAPSHOT_MS = 1794309840000;
+/**
+ * Архів копій у репозиторії: шлюз тримає лише останні ~995 записів,
+ * тому старі копії щодня витіснюються. Архів дозволяє їх надолужити.
+ */
+const REPO_DIR = new URL("../recovery-archive/", import.meta.url).pathname;
+
+function archiveFiles(): string[] {
+  try {
+    return readdirSync(REPO_DIR)
+      .filter((name) => name.endsWith(".json"))
+      .sort()
+      .map((name) => REPO_DIR + name);
+  } catch {
+    return [];
+  }
+}
 
 async function gwGet(path: string): Promise<any> {
   const res = await fetch(GW + path, { headers: { Authorization: GW_AUTH } });
@@ -137,6 +155,34 @@ async function pullCopies(): Promise<OrderCopy[]> {
     if ((index + 1) % 100 === 0) console.log(`  ${index + 1}/${ids.length}…`);
   }
 
+  copies.sort((a, b) => a.date - b.date);
+
+  // Те, що витіснили зі шлюзу, добираємо з архіву в репозиторії.
+  const present = new Set(copies.map((copy) => copy.id));
+  let fromArchive = 0;
+  for (const path of archiveFiles()) {
+    let pack: any;
+    try {
+      pack = JSON.parse(readFileSync(path, "utf8"));
+    } catch {
+      continue;
+    }
+    for (const row of pack.rows ?? []) {
+      const id = String(row.id);
+      if (present.has(id) || !row.site_order?.items?.length) continue;
+      copies.push({
+        id,
+        site_order: row.site_order,
+        paid: Number(row.site_order.paymentStatus) === 1,
+        total: Number(row.site_order.totalCost) || 0,
+        date: Number(row.site_order.date) || 0,
+        archived: true,
+      });
+      present.add(id);
+      fromArchive += 1;
+    }
+  }
+  if (fromArchive > 0) console.log(`  добрано з архіву (уже витіснене зі шлюзу): ${fromArchive}`);
   copies.sort((a, b) => a.date - b.date);
   writeFileSync(PACK_PATH, JSON.stringify({ generated_at: Date.now(), rows: copies }));
   return copies;
