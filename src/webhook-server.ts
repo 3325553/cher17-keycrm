@@ -3,6 +3,14 @@ import { CONFIG, REDIS_KEYS } from "./config";
 import type { SiteOrder, OrderMapping } from "./types";
 import { enqueueOrder } from "./queue-service";
 import {
+  collectBacklog,
+  backlogToCsv,
+  checkOrders,
+  replayOrders,
+  parseDateParam,
+} from "./recovery-service";
+import { getCrmRequestRate } from "./crm-guard";
+import {
   getOrderHistory,
   getOrderHistoryLegacy,
   getOrderHistoryCount,
@@ -427,6 +435,136 @@ export function createWebhookServer() {
         }),
       },
     )
+    .get("/backlog", async ({ headers, query, set, server, request }) => {
+      if (!isAuthorizedHistoryRequest(headers)) {
+        set.status = 401;
+        set.headers["www-authenticate"] = 'Basic realm="cher17-history"';
+        return { success: false, error: "Unauthorized" };
+      }
+
+      // Сканування всього сховища може тривати кілька секунд.
+      server?.timeout(request, 255);
+
+      try {
+        const report = await collectBacklog({
+          paidOnly: query.paid === "1",
+          includeKnown: query.known === "1",
+          since: parseDateParam(query.since),
+          until: parseDateParam(query.until, true),
+          limit: query.limit ? parseInt(query.limit) : undefined,
+        });
+
+        if (query.format === "csv") {
+          set.headers["content-type"] = "text/csv; charset=utf-8";
+          return backlogToCsv(report);
+        }
+
+        return { success: true, ...report };
+      } catch (error) {
+        console.error("Помилка збору переліку без картки:", error);
+        set.status = 409;
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : "Failed to collect backlog",
+        };
+      }
+    }, {
+      query: t.Object({
+        paid: t.Optional(t.String()),
+        known: t.Optional(t.String()),
+        since: t.Optional(t.String()),
+        until: t.Optional(t.String()),
+        limit: t.Optional(t.String()),
+        format: t.Optional(t.String()),
+      }),
+    })
+    .post("/check", async ({ headers, body, set, server, request }) => {
+      if (!isAuthorizedHistoryRequest(headers)) {
+        set.status = 401;
+        set.headers["www-authenticate"] = 'Basic realm="cher17-history"';
+        return { success: false, error: "Unauthorized" };
+      }
+
+      // Звірка з CRM — це один запит на номер, тож пакет може чекати на ліміт.
+      server?.timeout(request, 255);
+
+      try {
+        const result = await checkOrders(body.ids, {
+          crm: body.crm === true,
+          repair: body.repair === true,
+        });
+
+        const withCrm = result.results.filter((item) => item.crm_check);
+        const absent = withCrm.filter((item) => item.crm_check?.state === "absent");
+        return {
+          success: true,
+          ...result,
+          summary: {
+            exists: withCrm.filter((item) => item.crm_check?.state === "exists").length,
+            absent: absent.length,
+            unknown: withCrm.filter((item) => item.crm_check?.state === "unknown").length,
+            absent_paid_count: absent.filter((item) => item.paid).length,
+            absent_paid_total: Math.round(
+              absent.filter((item) => item.paid).reduce((acc, item) => acc + item.total, 0) * 100,
+            ) / 100,
+          },
+        };
+      } catch (error) {
+        console.error("Помилка звірки замовлень:", error);
+        set.status = 500;
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : "Failed to check orders",
+        };
+      }
+    }, {
+      body: t.Object({
+        ids: t.Array(t.String()),
+        crm: t.Optional(t.Boolean()),
+        repair: t.Optional(t.Boolean()),
+      }),
+    })
+    .post("/replay", async ({ headers, body, set, server, request }) => {
+      if (!isAuthorizedHistoryRequest(headers)) {
+        set.status = 401;
+        set.headers["www-authenticate"] = 'Basic realm="cher17-history"';
+        return { success: false, error: "Unauthorized" };
+      }
+
+      server?.timeout(request, 255);
+
+      try {
+        const report = await replayOrders({
+          ids: body.ids,
+          paidOnly: body.paidOnly,
+          since: parseDateParam(body.since),
+          until: parseDateParam(body.until, true),
+          limit: body.limit,
+          paceSec: body.paceSec,
+          force: body.force,
+          dryRun: body.dryRun,
+        });
+        return { success: true, ...report };
+      } catch (error) {
+        console.error("Помилка повторної відправки:", error);
+        set.status = 409;
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : "Failed to replay orders",
+        };
+      }
+    }, {
+      body: t.Object({
+        ids: t.Optional(t.Array(t.String())),
+        paidOnly: t.Optional(t.Boolean()),
+        since: t.Optional(t.String()),
+        until: t.Optional(t.String()),
+        limit: t.Optional(t.Number()),
+        paceSec: t.Optional(t.Number()),
+        force: t.Optional(t.Boolean()),
+        dryRun: t.Optional(t.Boolean()),
+      }),
+    })
     .get("/styles.css", ({ headers, set }) => {
       if (!isAuthorizedHistoryRequest(headers)) {
         set.status = 401;
@@ -763,6 +901,7 @@ export function createWebhookServer() {
 
         return {
           status: "healthy",
+          crmRate: getCrmRequestRate(),
           queues: {
             pending: pendingCount,
             processing: processingCount,

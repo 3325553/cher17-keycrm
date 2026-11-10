@@ -15,6 +15,22 @@ export const CONFIG = {
   FISCALIZATION_MAX_RETRIES: 30,
   FISCALIZATION_INITIAL_BACKOFF_MS: 60 * 1000, // Першу перевірку статусу фіскалізації робимо через 1 хвилину
   FISCALIZATION_MAX_BACKOFF_MS: 15 * 60 * 1000,
+  // Відмова ліміту CRM — не «готово», а відкладення з паузою, щоб не спалити квоту дарма.
+  RATE_LIMIT_RETRY_MS: 60 * 1000,
+  // Захисний блок створення ще тримає інший воркер — пробуємо пізніше, а не звітуємо успіх.
+  LOCK_BUSY_RETRY_MS: 30 * 1000,
+  MAX_RATE_LIMIT_DEFERS: 30,
+  // Повторна відправка зі збережених копій: темп і максимальний пакет за один виклик.
+  REPLAY_PACE_SEC: 10,
+  REPLAY_MAX_BATCH: 100,
+  // Жорстка нижня межа відновлення: замовлення, створені раніше цієї дати, не чіпаємо.
+  RECOVERY_SINCE: "2026-11-01",
+  // Скільки замовлень можна звірити з CRM за один виклик (1 запит на замовлення).
+  CHECK_MAX_BATCH: 100,
+  // Спільний ліміт ключа CRM — 120 запитів/хв. Тримаємо запас, щоб не ловити відмови.
+  CRM_MAX_REQUESTS_PER_MIN: 100,
+  // Завислий запит не має блокувати чергу назавжди.
+  CRM_REQUEST_TIMEOUT_MS: 30 * 1000,
 };
 
 export const REDIS_KEYS = {
@@ -43,5 +59,7 @@ export const REDIS_KEYS = {
   FISCALIZATION_DELAYED_QUEUE: "orders:fiscalization:delayed",
   FISCALIZATION_DEAD_LETTER_QUEUE: "orders:fiscalization:dlq",
   ORDER_LOCK: (orderId: string) => `orders:lock:${orderId}`,
+  CREATE_LOCK: (orderId: string) => `orders:create_lock:${orderId}`,
+  RATE_LIMIT_DEFERS: (orderId: string) => `orders:rate_limit_defers:${orderId}`,
   WORKER_STATS: (worker: string) => `workers:stats:${worker}`,
 };

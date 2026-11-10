@@ -4,6 +4,7 @@ import { CONFIG, REDIS_KEYS } from "./config";
 import { addStatusToHistory, getOrderMapping } from "./order-mapping-service";
 import { calculateBackoff } from "./utils";
 import { enqueueDelayed } from "./delayed-queue";
+import { CrmUnavailableError, isCrmRejection } from "./crm-guard";
 
 const api = new SDK("https://openapi.keycrm.app/v1", Bun.env["KEYCRM_KEY"]);
 const BAS_STATUS_ID = 4;
@@ -50,6 +51,10 @@ async function resolveSiteOrderId(
 
   try {
     const order: any = await api.order.getOrderById(crmOrderId);
+    // Відмова CRM — не «замовлення без source_uuid», зв'язок не псуємо.
+    if (isCrmRejection(order)) {
+      return crmOrderId;
+    }
     const derivedSiteOrderId = String(order?.source_uuid || crmOrderId);
 
     if (derivedSiteOrderId && derivedSiteOrderId !== "null") {
@@ -156,6 +161,12 @@ export async function moveFiscalizedOrderToBas(
   }
 
   const order: any = await api.order.getOrderById(crmOrderId);
+  if (isCrmRejection(order)) {
+    // Інакше відмова ліміту виглядала б як «статус змінився» і watch закрився назавжди.
+    throw new CrmUnavailableError(
+      `CRM відхилила читання замовлення ${crmOrderId}: ${String(order?.message ?? "відмова")}`,
+    );
+  }
   const currentStatusId = Number(order?.status_id);
   const fiscalStatus = normalizeFiscalStatus(order?.fiscal_status);
 
@@ -177,6 +188,12 @@ export async function moveFiscalizedOrderToBas(
   const updateResponse = await api.order.updateExistingOrder(crmOrderId, {
     status_id: BAS_STATUS_ID,
   });
+
+  if (isCrmRejection(updateResponse)) {
+    throw new CrmUnavailableError(
+      `CRM відхилила переведення замовлення ${crmOrderId} в BAS: ${String(updateResponse?.message ?? "відмова")}`,
+    );
+  }
 
   await redis.set(doneKey, String(BAS_STATUS_ID));
   await clearFiscalizationWatch(crmOrderId);
@@ -317,6 +334,11 @@ export async function processFiscalizationWatchItem(
 
   try {
     const order: any = await api.order.getOrderById(crmOrderId);
+    if (isCrmRejection(order)) {
+      throw new CrmUnavailableError(
+        `CRM відхилила перевірку фіскалізації ${crmOrderId}: ${String(order?.message ?? "відмова")}`,
+      );
+    }
     const currentStatusId = Number(order?.status_id);
     const fiscalStatus = normalizeFiscalStatus(order?.fiscal_status);
     const resolvedSourceUuid = sourceUuid ?? order?.source_uuid ?? null;

@@ -2,6 +2,23 @@ import redis from "./redis";
 import { REDIS_KEYS } from "./config";
 import type { SiteOrder, OrderMapping, OrderStatusHistoryEntry } from "./types";
 
+/**
+ * Відповідь CRM без номера картки (відмова ліміту, порожній апдейт, службове
+ * повідомлення) не має затирати вже відомий номер. Інакше історія виглядає так,
+ * ніби картки немає, хоча вона створена — і оплата падає з «CRM ID не знайдено».
+ */
+function mergeCrmOrder(previous: any, next: any): any {
+  if (next == null) return previous;
+  if (previous == null || typeof previous !== "object" || typeof next !== "object") return next;
+
+  const merged: any = { ...next };
+  if (merged.id == null && previous.id != null) merged.id = previous.id;
+  if (merged.source_uuid == null && previous.source_uuid != null) {
+    merged.source_uuid = previous.source_uuid;
+  }
+  return merged;
+}
+
 // Helper function to efficiently store status history in Redis hash
 async function addStatusToHistoryHash(
   rowid: string,
@@ -90,9 +107,9 @@ export async function createOrUpdateOrderMapping(
     existing.updated_at = now;
     existing.site_order = siteOrder;
 
-    // Update CRM data if provided
+    // Update CRM data if provided (номер картки не губимо)
     if (crmResponse) {
-      existing.crm_order = crmResponse;
+      existing.crm_order = mergeCrmOrder(existing.crm_order, crmResponse);
     }
 
     const updatedData = JSON.stringify(existing);
@@ -148,9 +165,9 @@ export async function addStatusToHistory(
   }
   existing.updated_at = Date.now();
 
-  // Update CRM data if provided
+  // Update CRM data if provided (номер картки не губимо)
   if (crmResponse) {
-    existing.crm_order = crmResponse;
+    existing.crm_order = mergeCrmOrder(existing.crm_order, crmResponse);
   }
 
   const updatedData = JSON.stringify(existing);

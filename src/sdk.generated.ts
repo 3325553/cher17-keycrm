@@ -1,3 +1,9 @@
+// УВАГА: файл згенерований, але містить ручні правки, які треба зберігати
+// при повторній генерації (ліміт темпу, таймаут, позначка відмов CRM __httpStatus
+// та filter[source_uuid] у getOrdersBySourceUuid).
+import { CONFIG } from "./config";
+import { awaitCrmSlot } from "./crm-guard";
+
 export type Order = {
   id?: number;
   parent_id?: number;
@@ -908,12 +914,40 @@ export class ApiClient {
     if (this.token) {
       headers["Authorization"] = `Bearer ${this.token}`;
     }
-    const res = await fetch(this.baseUrl + path, {
-      method: method,
-      headers,
-      body: body ? JSON.stringify(body) : undefined,
-    });
-    return await res.json();
+    // Спільний ліміт ключа: краще зачекати, ніж отримати відмову,
+    // яку викликач може помилково прийняти за «даних немає».
+    await awaitCrmSlot();
+    let res: Response;
+    try {
+      res = await fetch(this.baseUrl + path, {
+        method: method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(CONFIG.CRM_REQUEST_TIMEOUT_MS),
+      });
+    } catch (e) {
+      // Мережа/таймаут — це невідомий стан, а не порожня відповідь CRM.
+      return {
+        __httpStatus: 504,
+        message: `CRM недоступна (${method} ${path}): ${e instanceof Error ? e.message : String(e)}`,
+      };
+    }
+    let parsed: any;
+    try {
+      parsed = await res.json();
+    } catch {
+      parsed = {
+        __httpStatus: res.status,
+        message: `CRM віддала не-JSON відповідь (HTTP ${res.status})`,
+      };
+    }
+    // Відмови CRM (ліміт, автентифікація) приходять як звичайна відповідь із тілом,
+    // а не як виняток. Позначаємо їх статусом, щоб викликач міг відрізнити
+    // «немає даних» від «CRM відмовила» і не створював дубль навмання.
+    if (!res.ok && parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      parsed.__httpStatus = res.status;
+    }
+    return parsed;
   }
 }
 
@@ -931,9 +965,11 @@ export class OrderService {
   }
   async getOrdersBySourceUuid(sourceUuid: string): Promise<Record<string, any>> {
     const q = encodeURIComponent(sourceUuid);
+    // CRM ігнорує параметр source_uuid без filter[] і віддає останні замовлення,
+    // через що перевірка «чи вже є картка» ніколи не спрацьовувала.
     return this.client.request(
       "GET",
-      `/order?source_uuid=${q}&include=products.offer`,
+      `/order?filter%5Bsource_uuid%5D=${q}&include=products.offer`,
       undefined,
     );
   }
