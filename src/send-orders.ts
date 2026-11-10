@@ -8,9 +8,13 @@
  *   4) перевести оплачене в статус «оплачено»;
  *   5) доповісти, що саме сталося.
  *
- * Запуск:
- *   check  — лише перевірити, що в CRM (нічого не створює);
- *   send   — відправити; dry-run якщо не передано --live.
+ * Запуск (усе — одна команда, ключ CRM не покидає сервер):
+ *   check   — лише перевірити, що в CRM (нічого не створює);
+ *   send    — відправити; без --live тільки показує план;
+ *   report  — підсумок: скільком замовленням змінили результат.
+ *
+ * Копії бере не з файлу, а з самого шлюзу: замовлення з 01.11, у яких є товари.
+ * Так відправка працює одразу, без перезбирання і без передачі файлів.
  */
 import { readFileSync, writeFileSync } from "fs";
 import { SDK } from "./sdk.generated";
@@ -29,7 +33,6 @@ const api = new SDK("https://openapi.keycrm.app/v1", Bun.env["KEYCRM_KEY"]);
 type OrderCopy = {
   id: string;
   site_order: any;
-  crm_card_ids: string[];
   paid: boolean;
   total: number;
   date: number;
@@ -45,8 +48,62 @@ type Outcome = {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function loadCopies(path: string): OrderCopy[] {
-  const pack = JSON.parse(readFileSync(path, "utf8"));
+const GW = Bun.env["GATEWAY_URL"] ?? "http://127.0.0.1:3000";
+const GW_AUTH = `Basic ${btoa(`${Bun.env["HISTORY_USER"] ?? "dev"}:${Bun.env["HISTORY_PASS"] ?? "dev"}`)}`;
+const PACK_PATH = "/tmp/recovery_pack.json";
+const STATE_PATH = "/tmp/send_state.json";
+/** 01.11 за Києвом — межа, нижче якої замовлення не чіпаємо. */
+const SINCE_MS = Date.parse("2026-10-31T22:00:00Z");
+
+async function gwGet(path: string): Promise<any> {
+  const res = await fetch(GW + path, { headers: { Authorization: GW_AUTH } });
+  if (res.ok) return res.json();
+  const cached = await Bun.file(PACK_PATH).exists();
+  if (!cached) throw new Error(`шлюз віддав HTTP ${res.status} на ${path}`);
+  return JSON.parse(await Bun.file(PACK_PATH).text());
+}
+
+/** Усі копії з 01.11, які шлюз ще пам'ятає (список + повна копія по кожному). */
+async function pullCopies(): Promise<OrderCopy[]> {
+  const seen = new Map<string, any>();
+  for (const status of ["completed", "failed"]) {
+    const page = await gwGet(`/history?status=${status}&limit=50000`);
+    for (const order of page.orders ?? []) {
+      const date = Number(order?.site_order?.date ?? 0);
+      if (!date || date < SINCE_MS) continue;
+      seen.set(String(order._rowid), order.site_order ?? {});
+    }
+  }
+
+  const ids = [...seen.keys()];
+  console.log(`у вікні з 01.11: ${ids.length}; знімаю повні копії…`);
+  const copies: OrderCopy[] = [];
+  for (let index = 0; index < ids.length; index += 1) {
+    const id = ids[index]!;
+    try {
+      const detail = await gwGet(`/history/order/${id}`);
+      const site = detail?.order?.site_order ?? null;
+      if (!site?.items?.length) continue;
+      copies.push({
+        id,
+        site_order: site,
+        paid: String(site.paymentStatus) === "1",
+        total: Number(site.totalCost) || 0,
+        date: Number(site.date) || 0,
+      });
+    } catch (error) {
+      console.log(`  ${id}: копію не взято (${String(error).slice(0, 60)})`);
+    }
+    if ((index + 1) % 100 === 0) console.log(`  ${index + 1}/${ids.length}…`);
+  }
+
+  copies.sort((a, b) => a.date - b.date);
+  writeFileSync(PACK_PATH, JSON.stringify({ generated_at: Date.now(), rows: copies }));
+  return copies;
+}
+
+function loadCopies(): OrderCopy[] {
+  const pack = JSON.parse(readFileSync(PACK_PATH, "utf8"));
   return (pack.rows as OrderCopy[])
     .filter((row) => row.site_order && row.id)
     .sort((a, b) => (a.date ?? 0) - (b.date ?? 0));
@@ -201,14 +258,22 @@ async function processOne(copy: OrderCopy, live: boolean): Promise<Outcome> {
 
 async function main() {
   const args = Bun.argv.slice(2);
-  const mode = args.includes("check") ? "check" : "send";
+  const mode = args.includes("check") ? "check" : args.includes("report") ? "report" : "send";
   const live = args.includes("--live");
+  const paidOnly = !args.includes("--all");
   const limitArg = args.find((arg) => /^--limit=\d+$/.test(arg));
   const idsArg = args.find((arg) => arg.startsWith("--ids="));
-  const packPath = "/tmp/recovery_pack.json";
-  const statePath = "/tmp/send_state.json";
 
-  let copies = loadCopies(packPath);
+  // Переривання з клавіатури не має лишати нас без підсумку.
+  let stopRequested = false;
+  process.on("SIGINT", () => {
+    stopRequested = true;
+    console.log("\n⏹  зупинка після поточного замовлення…");
+  });
+
+  const pulled = await pullCopies();
+  let copies = pulled;
+  if (paidOnly) copies = copies.filter((copy) => copy.paid);
   if (idsArg) {
     const wanted = new Set(idsArg.replace("--ids=", "").split(",").map((id) => id.trim()));
     copies = copies.filter((copy) => wanted.has(copy.id));
@@ -216,22 +281,36 @@ async function main() {
   const limit = limitArg ? Number(limitArg.split("=")[1]) : copies.length;
   copies = copies.slice(0, limit);
 
-  console.log(`режим: ${mode}${live ? " (жива відправка)" : " (без записів)"} | замовлень: ${copies.length}`);
+  const total = copies.reduce((acc, copy) => acc + (Number(copy.site_order.totalCost) || 0), 0);
+  console.log(
+    `режим: ${mode}${live ? " (жива відправка)" : " (без записів)"} | замовлень: ${copies.length} на ${Math.round(total)} грн`,
+  );
+
   const outcomes: Outcome[] = [];
   const started = Date.now();
+  const progress = () => {
+    writeFileSync(STATE_PATH, JSON.stringify({ updated: Date.now(), mode, live, outcomes }, null, 0));
+  };
 
   for (const [index, copy] of copies.entries()) {
-    const outcome = await processOne(copy, mode === "send" && live);
+    if (stopRequested) break;
+    let outcome = await processOne(copy, mode === "send" && live);
+    if (outcome.state === "unknown") {
+      // Невідомий стан не вважаємо втратою: пробуємо ще раз після паузи.
+      await sleep(2000);
+      outcome = await processOne(copy, mode === "send" && live);
+    }
     outcomes.push(outcome);
     console.log(
       `${index + 1}/${copies.length}  ${copy.id}  ${Math.round(outcome.total)} грн  → ${outcome.state}` +
         `${outcome.card_id ? " (" + outcome.card_id + ")" : ""}  ${outcome.note}`,
     );
-    writeFileSync(statePath, JSON.stringify({ updated: Date.now(), outcomes }, null, 0));
-    if (mode === "send" && outcome.state === "failed") {
+    progress();
+
+    if (mode === "send" && live) {
       const failed = outcomes.filter((item) => item.state === "failed").length;
       if (failed >= 10 && failed / outcomes.length > 0.3) {
-        console.log("⛔ забагато відмов поспіль — зупиняюсь, щоб не палити квоту");
+        console.log("⛔ забагато відмов — зупиняюсь, щоб не палити квоту");
         break;
       }
     }
@@ -240,8 +319,25 @@ async function main() {
 
   const summary: Record<string, number> = {};
   for (const outcome of outcomes) summary[outcome.state] = (summary[outcome.state] ?? 0) + 1;
+  const created = outcomes.filter((item) => item.state === "created");
+  const exists = outcomes.filter((item) => item.state === "exists" || item.state === "paid_only");
   console.log("\nпідсумок:", JSON.stringify(summary));
+  console.log(
+    `отримали картку: ${created.length} на ${Math.round(created.reduce((acc, item) => acc + item.total, 0))} грн` +
+      ` | картка вже була: ${exists.length} | не вийшло: ${summary.failed ?? 0}`,
+  );
   console.log(`рівень запитів: ${JSON.stringify(getCrmRequestRate())} | ${Math.round((Date.now() - started) / 1000)} с`);
+
+  if (mode === "send" && live) {
+    console.log("\nконтрольний прохід по номерах, які не отримали картку…");
+    const leftover = outcomes.filter((item) => item.state === "failed");
+    for (const item of leftover) {
+      const copy = copies.find((entry) => entry.id === item.id)!;
+      const again = await processOne(copy, false);
+      console.log(`  ${item.id}: ${again.state}${again.card_id ? " (" + again.card_id + ")" : ""} — ${item.note}`);
+      await sleep(REQUEST_PAUSE_MS);
+    }
+  }
 }
 
 main().catch((error) => {
