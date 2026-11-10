@@ -398,6 +398,15 @@ export function matchCards(
  * Тому перевіряю, що після розбору лишаються і місто, і місце видачі.
  */
 export function hasDeliverableAddress(order: any): boolean {
+  // Електронний сертифікат їде на пошту, а не Новою Поштою —
+  // сайт тому й не передає адресу, і вимагати її тут помилково.
+  const items: any[] = Array.isArray(order?.items) ? order.items : [];
+  const onlyDigital =
+    items.length > 0 &&
+    items.every((item) => /сертифікат/i.test(String(item?.name ?? "")));
+  if (onlyDigital) {
+    return Boolean(String(order?.email ?? "").trim() || String(order?.phone ?? "").trim());
+  }
   const raw = String(order?.deliveryAddress ?? "").trim();
   if (!raw || /^не вказано$/i.test(raw)) return false;
   const shipping = parseShippingAddress(raw, String(order?.deliveryMethod ?? ""));
