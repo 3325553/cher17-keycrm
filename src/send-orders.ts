@@ -17,7 +17,7 @@
  */
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import { SDK } from "./sdk.generated";
-import { convertSiteOrderToCRM, formatPhoneNumber, validateSiteOrder } from "./utils";
+import { convertSiteOrderToCRM, formatPhoneNumber, parseShippingAddress, validateSiteOrder } from "./utils";
 import { isCrmRejection, getCrmRequestRate } from "./crm-guard";
 
 const PAID_ORDER_STATUS_ID = 4;
@@ -44,7 +44,7 @@ type OrderCopy = {
 type Outcome = {
   id: string;
   total: number;
-  state: "exists" | "created" | "paid_only" | "skipped" | "failed" | "unknown" | "lead_only" | "lead_paid";
+  state: "exists" | "created" | "paid_only" | "skipped" | "failed" | "unknown" | "lead_only" | "lead_paid" | "held";
   card_id: string | null;
   note: string;
 };
@@ -221,6 +221,22 @@ export function matchCards(
     order: known.find((card) => card.is_order) ?? null,
     lead: known.find((card) => !card.is_order) ?? null,
   };
+}
+
+/**
+ * Чи картка є справжнім замовленням для CRM: адреса не губиться.
+ * Копії, зняті зі шлюзу в листопаді, часто мають у способі достаки
+ * «Нова Пошта, відділення», але адреси немає (сайт не передав).
+ * Така картка в CRM виглядає як замовлення без доставки — водій його не повезе.
+ * Тому перевіряю, що після розбору лишаються і місто, і місце видачі.
+ */
+export function hasDeliverableAddress(order: any): boolean {
+  const raw = String(order?.deliveryAddress ?? "").trim();
+  if (!raw || /^не вказано$/i.test(raw)) return false;
+  const shipping = parseShippingAddress(raw, String(order?.deliveryMethod ?? ""));
+  if (!shipping?.city) return false;
+  const point = `${shipping.receivePoint ?? ""} ${shipping.secondaryLine ?? ""}`.trim();
+  return point.length > 0;
 }
 
 /** Запит за номером сайту: єдине надійне джерело для справжнього замовлення. */
@@ -429,6 +445,26 @@ async function processOne(copy: OrderCopy, live: boolean, cards: CrmCard[]): Pro
   }
 }
 
+/**
+ * Створює картку лише там, де її справді треба створити.
+ * Картку без адреси не створюю: вона не їде, а лише засмічує CRM.
+ * Такі номери збираються окремо — їх треба дістати з боку сайту.
+ */
+async function processGuarded(copy: OrderCopy, live: boolean, cards: CrmCard[]): Promise<Outcome> {
+  const order = normalizeCopy(copy.site_order);
+  const { order: knownOrder } = matchCards(cards, copy.id, order);
+  if (!knownOrder && !hasDeliverableAddress(order)) {
+    return {
+      id: copy.id,
+      total: Number(order.totalCost) || 0,
+      state: "held",
+      card_id: null,
+      note: `нема адреси доставки (${String(order.deliveryMethod ?? "спосіб не вказано")}) — картку не створюю`,
+    };
+  }
+  return processOne(copy, live, cards);
+}
+
 /** Підсумок зі файлу стану: що сталося з кожним номером і що лишилося без картки. */
 function printReport(): void {
   if (!existsSync(STATE_PATH)) {
@@ -447,6 +483,7 @@ function printReport(): void {
   console.log(`  • на лічі, оплату добрано:   ${by(["lead_paid"]).length} на ${sum(by(["lead_paid"]))} грн`);
   console.log(`  • осіли лише лідом:          ${by(["lead_only"]).length} на ${sum(by(["lead_only"]))} грн`);
   console.log(`  • не вийшло:                 ${by(["failed"]).length} на ${sum(by(["failed"]))} грн`);
+  console.log(`  • тримаю: нема адреси:       ${by(["held"]).length} на ${sum(by(["held"]))} грн`);
   console.log(`  • не перевірили (CRM мовчала): ${by(["unknown"]).length}`);
   console.log(`  • відсіяно до відправки:      ${by(["skipped"]).length}`);
 
@@ -454,6 +491,12 @@ function printReport(): void {
   if (left.length > 0) {
     console.log("\nбез картки після відправки:");
     for (const item of left) console.log(`  ${item.id}  ${Math.round(item.total)} грн  ${item.state}  ${item.note}`);
+  }
+
+  const held = by(["held"]);
+  if (held.length > 0) {
+    console.log("\nтримаю до з'ясування адреси (передзвонити й створити вручну):");
+    for (const item of held) console.log(`  ${item.id}  ${Math.round(item.total)} грн  ${item.note}`);
   }
 }
 
@@ -514,11 +557,11 @@ async function main() {
 
   for (const [index, copy] of copies.entries()) {
     if (stopRequested) break;
-    let outcome = await processOne(copy, mode === "send" && live, cards);
+    let outcome = await processGuarded(copy, mode === "send" && live, cards);
     if (outcome.state === "unknown") {
       // Невідомий стан не вважаємо втратою: пробуємо ще раз після паузи.
       await sleep(2000);
-      outcome = await processOne(copy, mode === "send" && live, cards);
+      outcome = await processGuarded(copy, mode === "send" && live, cards);
     }
     outcomes.push(outcome);
     console.log(
@@ -553,7 +596,7 @@ async function main() {
     const leftover = outcomes.filter((item) => item.state === "failed");
     for (const item of leftover) {
       const copy = copies.find((entry) => entry.id === item.id)!;
-      const again = await processOne(copy, false, cards);
+      const again = await processGuarded(copy, false, cards);
       console.log(`  ${item.id}: ${again.state}${again.card_id ? " (" + again.card_id + ")" : ""} — ${item.note}`);
       await sleep(REQUEST_PAUSE_MS);
     }

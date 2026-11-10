@@ -3,7 +3,7 @@
  * номер у заголовку картки й контакти. Перевіряємо це без мережі.
  */
 import { describe, test, expect } from "bun:test";
-import { matchCards, normalizeCopy, type CrmCard } from "./send-orders";
+import { hasDeliverableAddress, matchCards, normalizeCopy, type CrmCard } from "./send-orders";
 
 function card(overrides: Partial<CrmCard>): CrmCard {
   return {
@@ -82,5 +82,32 @@ describe("сума замовлення перед створенням карт
   test("замовлення зі справжньою сумою не змінюється", () => {
     const normal = { ...certificate, totalCost: 3609, discount: 190 };
     expect(normalizeCopy(normal)).toBe(normal);
+  });
+});
+
+describe("адреса доставки перед створенням картки", () => {
+  test("звичайна адреса Нової Пошти проходить", () => {
+    expect(
+      hasDeliverableAddress({
+        deliveryMethod: "Нова Пошта, відділення",
+        deliveryAddress: "Бориспіль, Бориспіль, Київський Шлях, 69в (міський парк)",
+      }),
+    ).toBe(true);
+  });
+
+  test("«Не вказано» не вважається адресою", () => {
+    expect(
+      hasDeliverableAddress({ deliveryMethod: "Нова Пошта, відділення", deliveryAddress: "Не вказано" }),
+    ).toBe(false);
+  });
+
+  test("одне місто без вулиці теж не адреса", () => {
+    expect(
+      hasDeliverableAddress({ deliveryMethod: "Нова Пошта, відділення", deliveryAddress: "Київ" }),
+    ).toBe(false);
+  });
+
+  test("порожня адреса не проходить", () => {
+    expect(hasDeliverableAddress({ deliveryMethod: "Нова Пошта", deliveryAddress: "" })).toBe(false);
   });
 });

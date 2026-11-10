@@ -62,6 +62,7 @@ function main(): void {
     created: [] as typeof paid,
     had: [] as typeof paid,
     leadPaid: [] as typeof paid,
+    held: [] as typeof paid,
     left: [] as typeof paid,
     untouched: [] as typeof paid,
   };
@@ -73,6 +74,7 @@ function main(): void {
     else if (stateOf === "created") groups.created.push(row);
     else if (stateOf === "lead_paid") groups.leadPaid.push(row);
     else if (["exists", "paid_only"].includes(stateOf)) groups.had.push(row);
+    else if (stateOf === "held") groups.held.push(row);
     else groups.left.push(row);
   }
 
@@ -85,6 +87,7 @@ function main(): void {
     ["картка вже була", groups.had.length, sum(groups.had)],
     ["на лічі, оплату добрано", groups.leadPaid.length, sum(groups.leadPaid)],
     ["створено зараз", groups.created.length, sum(groups.created)],
+    ["тримаю: нема адреси", groups.held.length, sum(groups.held)],
     ["не оброблено ще", groups.untouched.length, sum(groups.untouched)],
     ["лишилось без картки", groups.left.length, sum(groups.left)],
   ]);
@@ -109,6 +112,16 @@ function main(): void {
       const outcome = byId.get(row.id);
       const order = normalizeCopy(row.site_order);
       console.log(`  ${row.id}  ${money(Number(order.totalCost) || 0)} грн  ${outcome?.state ?? "—"}  ${outcome?.note ?? ""}`);
+    }
+  }
+
+  const held = groups.held;
+  if (held.length > 0) {
+    console.log(`\nБез адреси доставки — картку не створювали, треба передзвонити (${held.length}):`);
+    for (const row of held) {
+      const order = normalizeCopy(row.site_order);
+      const name = `${order.firstName ?? ""} ${order.lastName ?? ""}`.trim();
+      console.log(`  ${row.id}  ${money(Number(order.totalCost) || 0)} грн  ${name}  ${order.phone ?? ""}`);
     }
   }
 
