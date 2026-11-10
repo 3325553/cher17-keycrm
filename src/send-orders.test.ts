@@ -3,7 +3,7 @@
  * номер у заголовку картки й контакти. Перевіряємо це без мережі.
  */
 import { describe, test, expect } from "bun:test";
-import { matchCards, type CrmCard } from "./send-orders";
+import { matchCards, normalizeCopy, type CrmCard } from "./send-orders";
 
 function card(overrides: Partial<CrmCard>): CrmCard {
   return {
@@ -55,5 +55,32 @@ describe("звірка з готовим списком карток CRM", () =>
     const found = matchCards(cards, "381162", { phone: "", email: "" });
     expect(found.order?.id).toBe("21");
     expect(found.lead?.id).toBe("20");
+  });
+});
+
+describe("сума замовлення перед створенням картки", () => {
+  const certificate = {
+    externalOrderId: "379491",
+    paymentStatus: 1,
+    paymentMethod: "Оплата сертифікатом",
+    totalCost: 0,
+    discount: 1799,
+    items: [{ name: "Боді", cost: 1799, quantity: 1 }],
+  };
+
+  test("оплата сертифікатом: сума береться з позицій, знижка знімається", () => {
+    const fixed = normalizeCopy(certificate);
+    expect(fixed.totalCost).toBe(1799);
+    expect(fixed.discount).toBe(0);
+  });
+
+  test("оплата при отриманні з нульовою сумою не вигадує грошей", () => {
+    const cash = { ...certificate, paymentStatus: 0, paymentMethod: "Оплата при отриманні" };
+    expect(normalizeCopy(cash).totalCost).toBe(0);
+  });
+
+  test("замовлення зі справжньою сумою не змінюється", () => {
+    const normal = { ...certificate, totalCost: 3609, discount: 190 };
+    expect(normalizeCopy(normal)).toBe(normal);
   });
 });

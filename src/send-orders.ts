@@ -44,7 +44,7 @@ type OrderCopy = {
 type Outcome = {
   id: string;
   total: number;
-  state: "exists" | "created" | "paid_only" | "skipped" | "failed" | "unknown" | "lead_only";
+  state: "exists" | "created" | "paid_only" | "skipped" | "failed" | "unknown" | "lead_only" | "lead_paid";
   card_id: string | null;
   note: string;
 };
@@ -68,6 +68,8 @@ const GW = Bun.env["GATEWAY_URL"] ?? "http://127.0.0.1:3000";
 const GW_AUTH = `Basic ${btoa(`${Bun.env["HISTORY_USER"] ?? "dev"}:${Bun.env["HISTORY_PASS"] ?? "dev"}`)}`;
 const PACK_PATH = "/tmp/recovery_pack.json";
 const STATE_PATH = "/tmp/send_state.json";
+/** Що вже було в CRM до відправки — для підсумкового звіту. */
+const CRM_BEFORE_PATH = "/tmp/crm_ids.json";
 /** 01.11 за Києвом — межа, нижче якої замовлення не чіпаємо. */
 const SINCE_MS = Date.parse("2026-10-31T22:00:00Z");
 
@@ -125,18 +127,25 @@ function loadCopies(): OrderCopy[] {
     .sort((a, b) => (a.date ?? 0) - (b.date ?? 0));
 }
 
-/** Сума замовлення має збігатися з сумою позицій, інакше CRM відхилить картку. */
-function normalizeCopy(order: any): any {
+/**
+ * Приводить копію до вигляду, придатного для CRM.
+ * Замовлення, оплачене сертифікатом, сайт віддає з нульовою сумою і знижкою,
+ * рівною кошику, — CRM таке відхиляє. Гроші при цьому є (сертифікат), тому
+ * суму беремо з позицій, а знижку знімаємо: картка має бути на повну вартість.
+ * Виняток — оплата при отриманні з нульовою сумою: там грошей справді не було.
+ */
+export function normalizeCopy(order: any): any {
   const items = Array.isArray(order.items) ? order.items : [];
   const fromItems = items.reduce(
     (acc: number, item: any) => acc + (Number(item.cost) || 0) * (Number(item.quantity) || 0),
     0,
   );
-  const discount = Number(order.discount) || 0;
   const total = Number(order.totalCost) || 0;
-  if (total > 0) return order;
-  if (fromItems <= 0) return order;
-  return { ...order, discount: discount >= fromItems ? 0 : discount, totalCost: fromItems };
+  if (total > 0 || fromItems <= 0) return order;
+  const paid = Number(order.paymentStatus) === 1;
+  const cashOnDelivery = /при отриманні/i.test(String(order.paymentMethod ?? ""));
+  if (!paid && cashOnDelivery) return order;
+  return { ...order, discount: 0, totalCost: fromItems };
 }
 
 /**
@@ -288,6 +297,39 @@ async function markPaid(cardId: string): Promise<boolean> {
   return false;
 }
 
+/** Чи вже є по картці оплата на цю суму (щоб не дописати її вдруге). */
+function hasPaidAmount(card: any, amount: number): boolean {
+  const payments: any[] = Array.isArray(card?.payments) ? card.payments : [];
+  return payments.some(
+    (payment) =>
+      Number(payment?.amount) === amount &&
+      String(payment?.status ?? "").toLowerCase() === "paid",
+  );
+}
+
+/**
+ * Знімання ліда відбулося без грошей: у картці ліда оплата не позначена, і
+ * поставити статус «оплачено» на лічі неможливо. Дописуємо оплату як платіж
+ * і переводимо картку в оплачений статус, щоб сума не загубилася в обліку.
+ */
+async function markLeadPaid(cardId: string, order: any, amount: number): Promise<boolean> {
+  if (amount <= 0) return false;
+
+  const card: any = await api.pipelines.getPipelinesCard(cardId);
+  if (!isCrmRejection(card) && hasPaidAmount(card, amount)) return true;
+
+  const payment: any = await api.pipelines.createNewPipelinesCardPayment(cardId, {
+    payment_method: String(order.paymentMethod ?? "Оплата"),
+    amount,
+    status: "paid",
+    description: `Оплата замовлення #${order.externalOrderId}`,
+  });
+  if (isCrmRejection(payment) || payment?.id == null) return false;
+
+  const updated: any = await api.pipelines.updatePipelinesCard(cardId, { status_id: PAID_ORDER_STATUS_ID });
+  return !isCrmRejection(updated);
+}
+
 async function createCard(order: any): Promise<string> {
   let lastError = "CRM не прийняла замовлення";
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -357,11 +399,19 @@ async function processOne(copy: OrderCopy, live: boolean, cards: CrmCard[]): Pro
   }
 
   if (knownLead && knownLead.status_id === DUPLICATE_LEAD_STATUS_ID) {
+    // Лід уже знято, але оплаченої суми по ньому немає — тоді гроші в CRM не позначені.
+    const amount = Number(order.totalCost) || 0;
+    if (!live) {
+      return { ...base, state: "lead_only", card_id: knownLead.id, note: "лід знято — оплату не позначено, потрібно вручну" };
+    }
+    const toppedUp = await markLeadPaid(knownLead.id, order, amount);
     return {
       ...base,
-      state: "lead_only",
+      state: toppedUp ? "lead_paid" : "lead_only",
       card_id: knownLead.id,
-      note: "лід позначено як дубль — творення замовлення може відхилятися, потрібен ручний розбір",
+      note: toppedUp
+        ? "лід знято — оплату позначено по картці ліда"
+        : "лід знято — оплату позначити не вдалося, потрібно вручну",
     };
   }
 
@@ -394,6 +444,7 @@ function printReport(): void {
   console.log(`перевірено номерів: ${outcomes.length} на ${sum(outcomes)} грн`);
   console.log(`  • створено зараз:            ${by(["created"]).length} на ${sum(by(["created"]))} грн`);
   console.log(`  • картка вже була:          ${by(["exists", "paid_only"]).length} на ${sum(by(["exists", "paid_only"]))} грн`);
+  console.log(`  • на лічі, оплату добрано:   ${by(["lead_paid"]).length} на ${sum(by(["lead_paid"]))} грн`);
   console.log(`  • осіли лише лідом:          ${by(["lead_only"]).length} на ${sum(by(["lead_only"]))} грн`);
   console.log(`  • не вийшло:                 ${by(["failed"]).length} на ${sum(by(["failed"]))} грн`);
   console.log(`  • не перевірили (CRM мовчала): ${by(["unknown"]).length}`);
@@ -447,6 +498,13 @@ async function main() {
   console.log(`звірка з CRM: беру картки з ${sinceIso} по ${CARD_SCAN_PAGE} за запит…`);
   const cards = await scanCrmCards(sinceIso);
   console.log(`у CRM за період карток: ${cards.length} (замовлень: ${cards.filter((c) => c.is_order).length})`);
+
+  // Знімок «що вже було» — щоб підсумковий звіт рахував було/створено без повторної звірки.
+  const hadBefore = copies
+    .filter((copy) => matchCards(cards, copy.id, normalizeCopy(copy.site_order)).order !== null)
+    .map((copy) => copy.id);
+  writeFileSync(CRM_BEFORE_PATH, JSON.stringify({ updated: Date.now(), ids: hadBefore }));
+  console.log(`з них картка вже є: ${hadBefore.length} із ${copies.length}`);
 
   const outcomes: Outcome[] = [];
   const started = Date.now();
