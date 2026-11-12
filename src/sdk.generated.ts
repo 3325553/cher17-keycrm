@@ -1,8 +1,9 @@
 // УВАГА: файл згенерований, але містить ручні правки, які треба зберігати
-// при повторній генерації (ліміт темпу, таймаут, позначка відмов CRM __httpStatus
-// та filter[source_uuid] у getOrdersBySourceUuid).
+// при повторній генерації (ліміт темпу, таймаут, позначка відмов CRM __httpStatus,
+// облік кожного звернення та filter[source_uuid] у getOrdersBySourceUuid).
 import { CONFIG } from "./config";
 import { awaitCrmSlot } from "./crm-guard";
+import { recordCrmCall } from "./crm-observability";
 
 export type Order = {
   id?: number;
@@ -916,7 +917,8 @@ export class ApiClient {
     }
     // Спільний ліміт ключа: краще зачекати, ніж отримати відмову,
     // яку викликач може помилково прийняти за «даних немає».
-    await awaitCrmSlot();
+    const waitedMs = await awaitCrmSlot();
+    const startedAt = Date.now();
     let res: Response;
     try {
       res = await fetch(this.baseUrl + path, {
@@ -926,6 +928,13 @@ export class ApiClient {
         signal: AbortSignal.timeout(CONFIG.CRM_REQUEST_TIMEOUT_MS),
       });
     } catch (e) {
+      await recordCrmCall({
+        method,
+        path,
+        status: 504,
+        durationMs: Date.now() - startedAt,
+        waitedMs,
+      });
       // Мережа/таймаут — це невідомий стан, а не порожня відповідь CRM.
       return {
         __httpStatus: 504,
@@ -947,6 +956,13 @@ export class ApiClient {
     if (!res.ok && parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       parsed.__httpStatus = res.status;
     }
+    await recordCrmCall({
+      method,
+      path,
+      status: res.status,
+      durationMs: Date.now() - startedAt,
+      waitedMs,
+    });
     return parsed;
   }
 }

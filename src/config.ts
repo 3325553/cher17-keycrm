@@ -13,6 +13,10 @@ export const CONFIG = {
   LEAD_HASH_TTL_SEC: 24 * 60 * 60,
   FISCALIZATION_WATCH_TTL_SEC: 48 * 60 * 60,
   FISCALIZATION_MAX_RETRIES: 30,
+  // Ключ CRM недоступний (ліміт/таймаут) — це не «чека немає», тому не спалимо
+  // лічильник спроб: карта стоїть під наглядом і пробує далі.
+  FISCALIZATION_CRM_DOWN_RETRY_MS: 60 * 1000,
+  FISCALIZATION_CRM_DOWN_MAX_BACKOFF_MS: 15 * 60 * 1000,
   FISCALIZATION_INITIAL_BACKOFF_MS: 60 * 1000, // Першу перевірку статусу фіскалізації робимо через 1 хвилину
   FISCALIZATION_MAX_BACKOFF_MS: 15 * 60 * 1000,
   // Відмова ліміту CRM — не «готово», а відкладення з паузою, щоб не спалити квоту дарма.
@@ -31,6 +35,11 @@ export const CONFIG = {
   CRM_MAX_REQUESTS_PER_MIN: 100,
   // Завислий запит не має блокувати чергу назавжди.
   CRM_REQUEST_TIMEOUT_MS: 30 * 1000,
+  // Скільки подій фіскалізації тримаємо в окремій книзі подій (їх майже ніколи
+  // не буває багато, а наслідки розбираються тижнями пізніше).
+  FISCAL_EVENT_LOG_SIZE: 500,
+  FISCAL_EVENT_LOG_TTL_SEC: 30 * 24 * 60 * 60,
+  CRM_CALL_DAY_TTL_SEC: 30 * 24 * 60 * 60,
 };
 
 export const REDIS_KEYS = {
@@ -62,4 +71,6 @@ export const REDIS_KEYS = {
   CREATE_LOCK: (orderId: string) => `orders:create_lock:${orderId}`,
   RATE_LIMIT_DEFERS: (orderId: string) => `orders:rate_limit_defers:${orderId}`,
   WORKER_STATS: (worker: string) => `workers:stats:${worker}`,
+  FISCALIZATION_EVENTS: "orders:fiscalization:events", // Список вхідних стукотів CRM
+  CRM_CALLS_DAY: (day: string) => `crm:calls:${day}`, // Хеш "операція:код" -> кількість за день
 };

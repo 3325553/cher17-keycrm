@@ -35,9 +35,10 @@ function dropExpired(now: number): void {
   }
 }
 
-/** Чекає вільне місце у вікні ліміту й резервує його. */
-export async function awaitCrmSlot(): Promise<void> {
+/** Чекає вільне місце у вікні ліміту й резервує його. Повертає час очікування. */
+export async function awaitCrmSlot(): Promise<number> {
   const limit = Math.max(1, CONFIG.CRM_MAX_REQUESTS_PER_MIN);
+  const queuedAt = Date.now();
 
   for (;;) {
     const now = Date.now();
@@ -47,7 +48,7 @@ export async function awaitCrmSlot(): Promise<void> {
     // зарезервувати одне й те саме місце.
     if (requestTimestamps.length < limit) {
       requestTimestamps.push(now);
-      return;
+      return now - queuedAt;
     }
 
     const waitMs = WINDOW_MS - (now - requestTimestamps[0]!) + 50;

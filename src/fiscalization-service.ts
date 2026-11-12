@@ -5,10 +5,15 @@ import { addStatusToHistory, getOrderMapping } from "./order-mapping-service";
 import { calculateBackoff } from "./utils";
 import { enqueueDelayed } from "./delayed-queue";
 import { CrmUnavailableError, isCrmRejection } from "./crm-guard";
+import { recordFiscalizationEvent } from "./crm-observability";
+import { sleep } from "./utils";
 
 const api = new SDK("https://openapi.keycrm.app/v1", Bun.env["KEYCRM_KEY"]);
 const BAS_STATUS_ID = 4;
 const FISCALIZATION_STATUS_ID = 2;
+// ~3 тижнів спроб з наростанням до 15 хв — стеля, щоб зовсім мертва CRM
+// не тримала картку в черзі вічно.
+const CRM_DOWN_MAX_ATTEMPTS = 2016;
 
 export interface FiscalizationWebhookPayload {
   event?: string;
@@ -33,6 +38,17 @@ function resolveRetryDelay(retryCount: number): number {
       CONFIG.FISCALIZATION_INITIAL_BACKOFF_MS,
       calculateBackoff(retryCount),
     ),
+  );
+}
+
+/**
+ * Затримка, коли CRM відповідає відмовою: стартуємо з хвилини й розріджуємо
+ * до чверті години, щоб не з'їдати квоту, яка вже вичерпана.
+ */
+function resolveCrmDownDelay(retryCount: number): number {
+  return Math.min(
+    CONFIG.FISCALIZATION_CRM_DOWN_MAX_BACKOFF_MS,
+    CONFIG.FISCALIZATION_CRM_DOWN_RETRY_MS * Math.pow(2, Math.min(retryCount, 10)),
   );
 }
 
@@ -102,6 +118,7 @@ export async function enqueueFiscalizationWatch(
   crmOrderId: string,
   sourceUuid?: string | null,
   crmResponse?: any,
+  options: { runInMs?: number } = {},
 ): Promise<{ queued: boolean; reason?: string }> {
   const doneMarker = await redis.get(REDIS_KEYS.FISCALIZATION_DONE(crmOrderId));
   if (doneMarker) {
@@ -131,7 +148,8 @@ export async function enqueueFiscalizationWatch(
   await redis.del(REDIS_KEYS.FISCALIZATION_RETRY_COUNT(crmOrderId));
   await redis.del(REDIS_KEYS.FISCALIZATION_RETRY_AT(crmOrderId));
   const payload = JSON.stringify({ crmOrderId, sourceUuid: sourceUuid ?? null });
-  const firstRunAt = Date.now() + CONFIG.FISCALIZATION_INITIAL_BACKOFF_MS;
+  const firstRunAt =
+    Date.now() + Math.max(0, options.runInMs ?? CONFIG.FISCALIZATION_INITIAL_BACKOFF_MS);
   await redis.set(REDIS_KEYS.FISCALIZATION_RETRY_AT(crmOrderId), String(firstRunAt));
   await enqueueDelayed(
     REDIS_KEYS.FISCALIZATION_DELAYED_QUEUE,
@@ -145,6 +163,12 @@ export async function enqueueFiscalizationWatch(
     sourceUuid,
     crmResponse || { message: `Запущено watch для фіскалізації замовлення ${crmOrderId}.` },
   );
+  await recordFiscalizationEvent({
+    crmOrderId,
+    direction: "out",
+    action: "watch_started",
+    detail: `перевірка через ${Math.round((firstRunAt - Date.now()) / 1000)}с`,
+  });
 
   return { queued: true };
 }
@@ -153,7 +177,7 @@ export async function moveFiscalizedOrderToBas(
   crmOrderId: string,
   sourceUuid?: string | null,
   crmResponse?: any,
-): Promise<{ moved: boolean; reason?: string }> {
+): Promise<{ moved: boolean; reason?: string; crmDown?: boolean }> {
   const doneKey = REDIS_KEYS.FISCALIZATION_DONE(crmOrderId);
   const doneMarker = await redis.get(doneKey);
   if (doneMarker) {
@@ -163,9 +187,11 @@ export async function moveFiscalizedOrderToBas(
   const order: any = await api.order.getOrderById(crmOrderId);
   if (isCrmRejection(order)) {
     // Інакше відмова ліміту виглядала б як «статус змінився» і watch закрився назавжди.
-    throw new CrmUnavailableError(
-      `CRM відхилила читання замовлення ${crmOrderId}: ${String(order?.message ?? "відмова")}`,
-    );
+    return {
+      moved: false,
+      reason: "crm_down",
+      crmDown: true,
+    };
   }
   const currentStatusId = Number(order?.status_id);
   const fiscalStatus = normalizeFiscalStatus(order?.fiscal_status);
@@ -185,14 +211,25 @@ export async function moveFiscalizedOrderToBas(
     return { moved: false, reason: "not_done" };
   }
 
-  const updateResponse = await api.order.updateExistingOrder(crmOrderId, {
+  let updateResponse = await api.order.updateExistingOrder(crmOrderId, {
     status_id: BAS_STATUS_ID,
   });
 
   if (isCrmRejection(updateResponse)) {
-    throw new CrmUnavailableError(
-      `CRM відхилила переведення замовлення ${crmOrderId} в BAS: ${String(updateResponse?.message ?? "відмова")}`,
-    );
+    // Одна миттєва спроба слідом: відмова найчастіше разова (квота хвилини),
+    // а друга втрата уже йде у повтор через гляд, а не у «забули картку».
+    await sleep(2000);
+    updateResponse = await api.order.updateExistingOrder(crmOrderId, {
+      status_id: BAS_STATUS_ID,
+    });
+  }
+
+  if (isCrmRejection(updateResponse)) {
+    return {
+      moved: false,
+      reason: "crm_down",
+      crmDown: true,
+    };
   }
 
   await redis.set(doneKey, String(BAS_STATUS_ID));
@@ -203,6 +240,12 @@ export async function moveFiscalizedOrderToBas(
     sourceUuid ?? order?.source_uuid,
     updateResponse,
   );
+  await recordFiscalizationEvent({
+    crmOrderId,
+    direction: "out",
+    action: "moved_to_bas",
+    detail: "картку передано у фінальний статус",
+  });
 
   return { moved: true };
 }
@@ -219,6 +262,13 @@ export async function handleFiscalizationWebhook(
   const statusId = Number(payload.context?.status_id);
   const fiscalStatus = normalizeFiscalStatus(payload.context?.fiscal_status);
 
+  await recordFiscalizationEvent({
+    crmOrderId,
+    direction: "in",
+    action: "knock_received",
+    payload: payload.context,
+  });
+
   await appendFiscalizationHistory(
     crmOrderId,
     "fiscalization_webhook_received",
@@ -233,12 +283,37 @@ export async function handleFiscalizationWebhook(
       sourceUuid,
       { message: `Webhook проігноровано: status_id=${statusId}` },
     );
+    await recordFiscalizationEvent({
+      crmOrderId,
+      direction: "out",
+      action: "ignored_status",
+      detail: `status_id=${statusId}`,
+    });
     return { success: true, action: "ignored", crmOrderId };
   }
 
   if (fiscalStatus === "done") {
     const result = await moveFiscalizedOrderToBas(crmOrderId, sourceUuid, payload.context);
-    return { success: true, action: result.moved ? "moved_to_bas" : String(result.reason || "noop"), crmOrderId };
+    if (result.moved) {
+      return { success: true, action: "moved_to_bas", crmOrderId };
+    }
+
+    if (result.reason === "crm_down") {
+      // Стукіт від CRM буває один і повтору звідти не буде. Тому картку не
+      // «відбиваємо помилкою», а беремо під нагляд і добиваємо перенесення самі.
+      await recordFiscalizationEvent({
+        crmOrderId,
+        direction: "out",
+        action: "move_failed_take_watch",
+        detail: "CRM відхилила перенесення — картку поставлено під нагляд",
+      });
+      await enqueueFiscalizationWatch(crmOrderId, sourceUuid, payload.context, {
+        runInMs: CONFIG.FISCALIZATION_CRM_DOWN_RETRY_MS,
+      });
+      return { success: true, action: "retry_scheduled", crmOrderId };
+    }
+
+    return { success: true, action: String(result.reason || "noop"), crmOrderId };
   }
 
   const result = await enqueueFiscalizationWatch(crmOrderId, sourceUuid, payload.context);
@@ -254,12 +329,21 @@ export async function clearFiscalizationWatch(crmOrderId: string): Promise<void>
 export async function requeueFiscalizationWatch(
   crmOrderId: string,
   sourceUuid?: string | null,
+  crmDown = false,
 ): Promise<void> {
   const retryKey = REDIS_KEYS.FISCALIZATION_RETRY_COUNT(crmOrderId);
   const retryCount = Number((await redis.get(retryKey)) || 0) + 1;
 
-  if (retryCount > CONFIG.FISCALIZATION_MAX_RETRIES) {
-    const timeoutMessage = `Перевищено ліміт перевірок фіскалізації (${CONFIG.FISCALIZATION_MAX_RETRIES}).`;
+  // CRM відхилила саме звернення (квота, таймаут) — це не «чека немає».
+  // Таку картку не спускаємо на полицю, а пробуємо, доки не вийде.
+  const retryCeiling = crmDown
+    ? CRM_DOWN_MAX_ATTEMPTS
+    : CONFIG.FISCALIZATION_MAX_RETRIES;
+
+  if (retryCount > retryCeiling) {
+    const timeoutMessage = crmDown
+      ? `CRM ${retryCeiling} разів відхиляла перевірку фіскалізації.`
+      : `Перевищено ліміт перевірок фіскалізації (${CONFIG.FISCALIZATION_MAX_RETRIES}).`;
     await appendFiscalizationHistory(
       crmOrderId,
       "fiscalization_watch_timeout",
@@ -268,12 +352,18 @@ export async function requeueFiscalizationWatch(
       timeoutMessage,
       retryCount,
     );
+    await recordFiscalizationEvent({
+      crmOrderId,
+      direction: "out",
+      action: "watch_dead_lettered",
+      detail: timeoutMessage,
+    });
     await redis.rpush(
       REDIS_KEYS.FISCALIZATION_DEAD_LETTER_QUEUE,
       createFiscalizationDlqPayload(
         crmOrderId,
         sourceUuid,
-        "max_retries_exceeded",
+        crmDown ? "crm_unavailable" : "max_retries_exceeded",
         retryCount,
         timeoutMessage,
       ),
@@ -282,11 +372,14 @@ export async function requeueFiscalizationWatch(
     return;
   }
 
-  const backoffMs = resolveRetryDelay(retryCount - 1);
+  const backoffMs = crmDown ? resolveCrmDownDelay(retryCount - 1) : resolveRetryDelay(retryCount - 1);
   const retryAt = Date.now() + backoffMs;
 
   await redis.set(retryKey, String(retryCount));
   await redis.set(REDIS_KEYS.FISCALIZATION_RETRY_AT(crmOrderId), String(retryAt));
+  // Поки картка під наглядом, тримаємо живим і сам маркер нагляду: інакше
+  // гляд тихо згасне через 48 год, а повторів вистачало б надовго.
+  await redis.expire(REDIS_KEYS.FISCALIZATION_WATCH(crmOrderId), CONFIG.FISCALIZATION_WATCH_TTL_SEC);
   await enqueueDelayed(
     REDIS_KEYS.FISCALIZATION_DELAYED_QUEUE,
     JSON.stringify({ crmOrderId, sourceUuid: sourceUuid ?? null }),
@@ -295,9 +388,13 @@ export async function requeueFiscalizationWatch(
 
   await appendFiscalizationHistory(
     crmOrderId,
-    "fiscalization_watch_retry",
+    crmDown ? "fiscalization_watch_retry_crm_down" : "fiscalization_watch_retry",
     sourceUuid,
-    { message: `Фіскалізація ще не завершена, повторна перевірка через ${Math.round(backoffMs / 1000)}с.` },
+    {
+      message: crmDown
+        ? `CRM недоступна, повторна спроба через ${Math.round(backoffMs / 1000)}с.`
+        : `Фіскалізація ще не завершена, повторна перевірка через ${Math.round(backoffMs / 1000)}с.`,
+    },
     undefined,
     retryCount,
   );
@@ -362,17 +459,27 @@ export async function processFiscalizationWatchItem(
         resolvedSourceUuid,
         { message: `Watch зупинено: status_id змінився на ${currentStatusId}.` },
       );
+      await recordFiscalizationEvent({
+        crmOrderId,
+        direction: "out",
+        action: "watch_stopped_status_changed",
+        detail: `status_id=${currentStatusId}`,
+      });
       await clearFiscalizationWatch(crmOrderId);
       return;
     }
 
     if (fiscalStatus === "done") {
-      await moveFiscalizedOrderToBas(crmOrderId, resolvedSourceUuid, order);
+      const result = await moveFiscalizedOrderToBas(crmOrderId, resolvedSourceUuid, order);
+      if (!result.moved && result.crmDown) {
+        await requeueFiscalizationWatch(crmOrderId, resolvedSourceUuid, true);
+      }
       return;
     }
 
     await requeueFiscalizationWatch(crmOrderId, resolvedSourceUuid);
   } catch (error) {
+    const crmDown = error instanceof CrmUnavailableError;
     const message = `Помилка перевірки фіскалізації: ${error instanceof Error ? error.message : error}`;
     await appendFiscalizationHistory(
       crmOrderId,
@@ -381,6 +488,6 @@ export async function processFiscalizationWatchItem(
       undefined,
       message,
     );
-    await requeueFiscalizationWatch(crmOrderId, sourceUuid);
+    await requeueFiscalizationWatch(crmOrderId, sourceUuid, crmDown);
   }
 }

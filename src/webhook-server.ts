@@ -12,6 +12,11 @@ import {
 } from "./recovery-service";
 import { getCrmRequestRate } from "./crm-guard";
 import {
+  readCrmCallCounts,
+  readFiscalizationEvents,
+  recordFiscalizationEvent,
+} from "./crm-observability";
+import {
   getOrderHistory,
   getOrderHistoryLegacy,
   getOrderHistoryCount,
@@ -24,7 +29,7 @@ import { renderHistoryPage } from "./history-ui.tsx";
 import historyAppScript from "./history-app.js" with { type: "text" };
 import historyStyles from "./history.generated.css" with { type: "text" };
 import redis from "./redis";
-import { handleFiscalizationWebhook } from "./fiscalization-service";
+import { handleFiscalizationWebhook, enqueueFiscalizationWatch } from "./fiscalization-service";
 import { getDelayedQueueCount, getNextDelayedRunAt } from "./delayed-queue";
 import { getWorkerStats } from "./worker-observability";
 
@@ -753,7 +758,51 @@ export function createWebhookServer() {
           error: "Failed to clean history",
         };
       }
-    });
+    })
+    .get(
+      "/fiscalization-events",
+      async ({ headers, query, set }) => {
+        if (!isAuthorizedHistoryRequest(headers)) {
+          set.status = 401;
+          set.headers["www-authenticate"] = 'Basic realm="cher17-history"';
+          return { success: false, error: "Unauthorized" };
+        }
+
+        const limit = Math.min(Number(query.limit) || 50, 500);
+        const crmOrderId = query.card?.trim();
+        let events = await readFiscalizationEvents(limit);
+
+        if (crmOrderId) {
+          events = events.filter((event) => String(event?.crm_order_id ?? "") === crmOrderId);
+        }
+
+        return { success: true, count: events.length, events };
+      },
+      {
+        query: t.Object({
+          limit: t.Optional(t.String()),
+          card: t.Optional(t.String()),
+        }),
+      },
+    )
+    .get(
+      "/crm-calls",
+      async ({ headers, query, set }) => {
+        if (!isAuthorizedHistoryRequest(headers)) {
+          set.status = 401;
+          set.headers["www-authenticate"] = 'Basic realm="cher17-history"';
+          return { success: false, error: "Unauthorized" };
+        }
+
+        const days = Math.min(Number(query.days) || 3, 30);
+        return { success: true, ...(await readCrmCallCounts(days)) };
+      },
+      {
+        query: t.Object({
+          days: t.Optional(t.String()),
+        }),
+      },
+    );
 
   // DLQ router group
   const dlqRouter = new Elysia({ prefix: "/dlq" })
@@ -849,6 +898,9 @@ export function createWebhookServer() {
         },
       )
 
+      // POST /fiscalization - прийом подій фіскалізації з CRM.
+      // Стукіт тут рівно один: будь-яка внутрішня помилка означає втрачену
+      // картку, тому обробка всередині себе ставить повтор, а не «відбиває» 400.
       .post(
         "/fiscalization",
         async ({ body, set }) => {
@@ -868,14 +920,38 @@ export function createWebhookServer() {
               ...result,
             };
           } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
             console.error("Помилка обробки fiscalization webhook:", {
               ...payloadSummary,
-              message: error instanceof Error ? error.message : String(error),
+              message,
             });
+
+            const crmOrderId = String(payloadSummary.id ?? "").trim();
+            await recordFiscalizationEvent({
+              crmOrderId: crmOrderId || null,
+              direction: "out",
+              action: "handler_error_retry_scheduled",
+              detail: message,
+            });
+
+            // Навіть якщо впала сама обробка — картка йде під нагляд і буде
+            // перенесена, як тільки CRM відповість нормально.
+            if (crmOrderId) {
+              try {
+                await enqueueFiscalizationWatch(crmOrderId, payloadSummary.source_uuid, undefined, {
+                  runInMs: CONFIG.FISCALIZATION_CRM_DOWN_RETRY_MS,
+                });
+                set.status = 200;
+                return { success: true, action: "retry_scheduled", crmOrderId };
+              } catch (watchError) {
+                console.error("Не вдалося поставити картку під нагляд після помилки:", watchError);
+              }
+            }
+
             set.status = 400;
             return {
               success: false,
-              error: error instanceof Error ? error.message : "Invalid fiscalization webhook",
+              error: message || "Invalid fiscalization webhook",
             };
           }
         },
@@ -918,10 +994,12 @@ export function createWebhookServer() {
           orders: await getWorkerStats("orders"),
           fiscalization: await getWorkerStats("fiscalization"),
         };
+        const calls = await readCrmCallCounts(1);
 
         return {
           status: "healthy",
           crmRate: getCrmRequestRate(),
+          crmCallsToday: calls.perDay,
           queues: {
             pending: pendingCount,
             processing: processingCount,
@@ -936,6 +1014,7 @@ export function createWebhookServer() {
             fiscalizationDelayedAt: nextFiscalizationRunAt,
           },
           workers,
+          fiscalizationEvents: await readFiscalizationEvents(10),
         };
       })
 

@@ -9,6 +9,7 @@ const store = new Map<string, string>();
 const lists = new Map<string, string[]>();
 const zsets = new Map<string, Map<string, number>>();
 const hashes = new Map<string, Map<string, string>>();
+const expirations = new Map<string, number>();
 let writes = 0;
 
 function list(key: string): string[] {
@@ -70,7 +71,8 @@ const fakeRedis = {
     if (removed > 0) writes++;
     return removed;
   },
-  async expire() {
+  async expire(key: string, ttl: number) {
+    expirations.set(key, ttl);
     return 1;
   },
   async llen(key: string) {
@@ -83,6 +85,23 @@ const fakeRedis = {
     writes++;
     list(key).push(...values.map(String));
     return list(key).length;
+  },
+  async lpush(key: string, ...values: string[]) {
+    writes++;
+    list(key).unshift(...values.map(String).reverse());
+    return list(key).length;
+  },
+  async lrange(key: string, start: number, stop: number) {
+    const items = list(key);
+    const end = stop < 0 ? items.length + stop : stop;
+    return items.slice(start, end + 1);
+  },
+  async ltrim(key: string, start: number, stop: number) {
+    const items = list(key);
+    const end = stop < 0 ? items.length + stop : stop;
+    lists.set(key, items.slice(start, end + 1));
+    writes++;
+    return "OK";
   },
   async lpop(key: string) {
     const value = list(key).shift() ?? null;
@@ -180,15 +199,21 @@ const fakeRedis = {
 
 mock.module("./redis", () => ({ default: fakeRedis }));
 
-const { REDIS_KEYS } = await import("./config");
+const { REDIS_KEYS, CONFIG } = await import("./config");
 const { collectBacklog, buildSnapshot, replayOrders, parseDateParam, checkOrders } = await import("./recovery-service");
 const { processOrder } = await import("./queue-service");
 const { createOrUpdateOrderMapping, addStatusToHistory, getOrderMapping } = await import("./order-mapping-service");
 const { isCrmRejection } = await import("./crm-guard");
+const { handleFiscalizationWebhook, processFiscalizationWatchItem } = await import("./fiscalization-service");
 
 type FetchCall = { method: string; path: string };
 let fetchCalls: FetchCall[] = [];
 let createMode: "throttle" | "ok" | "empty" = "ok";
+/** Картки для фіскалізації: id -> what CRM reports about status/receipt. */
+let fiscalCards: Record<string, { status_id: number; fiscal_status: string | null }> = {};
+/** Скільки послідовних відмов видає перенесення конкретної картки. */
+let updateRejects: { cardId: string; times: number } | null = null;
+let updateCalls: string[] = [];
 const CREATED_ID = 55501;
 
 function json(status: number, body: unknown): Response {
@@ -219,7 +244,15 @@ function installFetchStub() {
     }
     if (/^\/v1\/order\/\d+$/.test(parsed.pathname)) {
       const id = Number(parsed.pathname.split("/").pop());
-      if (method === "GET") return json(200, { id, status_id: 1 });
+      if (method === "GET") {
+        const card = fiscalCards[String(id)];
+        return json(200, card ? { id, ...card } : { id, status_id: 1 });
+      }
+      updateCalls.push(String(id));
+      if (updateRejects && updateRejects.cardId === String(id) && updateRejects.times > 0) {
+        updateRejects = { cardId: String(id), times: updateRejects.times - 1 };
+        return json(429, { message: "Too Many Attempts." });
+      }
       return json(200, { id, status_id: 4 });
     }
     return json(404, { message: `не очікуваний виклик ${method} ${path}` });
@@ -282,6 +315,9 @@ beforeEach(() => {
   hashes.clear();
   writes = 0;
   createMode = "ok";
+  fiscalCards = {};
+  updateRejects = null;
+  updateCalls = [];
   installFetchStub();
 });
 
@@ -563,5 +599,70 @@ describe("звірка з CRM", () => {
     const unknown = await checkOrders(["900020"], { crm: true });
     expect(unknown.results[0]?.crm_check?.state).toBe("unknown");
     expect(await fakeRedis.get(REDIS_KEYS.CRM_ORDER_ID("900020"))).toBeNull();
+  });
+});
+
+describe("єдиний стукіт фіскалізації", () => {
+  function knock(cardId: number) {
+    return handleFiscalizationWebhook({
+      event: "order.change_order_status",
+      context: { id: cardId, status_id: 2, fiscal_status: "done" },
+    });
+  }
+
+  test("CRM відхилила перенесення — картка не губиться, а стає під нагляд", async () => {
+    fiscalCards["43314"] = { status_id: 2, fiscal_status: "done" };
+    updateRejects = { cardId: "43314", times: 10 };
+
+    const result = await knock(43314);
+
+    expect(result.success).toBe(true);
+    expect(result.action).toBe("retry_scheduled");
+    // була одна миттєва друга спроба, і картка лишилася під наглядом з повтором
+    expect(updateCalls.filter((card) => card === "43314").length).toBe(2);
+    expect(await fakeRedis.get(REDIS_KEYS.FISCALIZATION_WATCH("43314"))).toBe("1");
+    expect((await fakeRedis.zrange(REDIS_KEYS.FISCALIZATION_DELAYED_QUEUE, 0, -1) as string[]).length).toBe(1);
+    expect(await fakeRedis.get(REDIS_KEYS.FISCALIZATION_DONE("43314"))).toBeNull();
+  });
+
+  test("CRM відповіла — картка перенесена, нагляду більше немає", async () => {
+    fiscalCards["43315"] = { status_id: 2, fiscal_status: "done" };
+
+    const result = await knock(43315);
+
+    expect(result.action).toBe("moved_to_bas");
+    expect(await fakeRedis.get(REDIS_KEYS.FISCALIZATION_DONE("43315"))).toBe("4");
+    expect(await fakeRedis.get(REDIS_KEYS.FISCALIZATION_WATCH("43315"))).toBeNull();
+    expect((await fakeRedis.zrange(REDIS_KEYS.FISCALIZATION_DELAYED_QUEUE, 0, -1) as string[]).length).toBe(0);
+  });
+
+  test("CRM недоступна й надалі — спроби тривають, картка не з'їдає ліміт «чека немає»", async () => {
+    fiscalCards["43316"] = { status_id: 2, fiscal_status: "done" };
+    updateRejects = { cardId: "43316", times: 100 };
+
+    await knock(43316);
+
+    // настав час чергової перевірки під нагляdom
+    await fakeRedis.del(REDIS_KEYS.FISCALIZATION_RETRY_AT("43316"));
+    await processFiscalizationWatchItem(JSON.stringify({ crmOrderId: "43316", sourceUuid: null }));
+
+    expect(await fakeRedis.llen(REDIS_KEYS.FISCALIZATION_DEAD_LETTER_QUEUE)).toBe(0);
+    expect(await fakeRedis.get(REDIS_KEYS.FISCALIZATION_WATCH("43316"))).toBe("1");
+    expect(Number(await fakeRedis.get(REDIS_KEYS.FISCALIZATION_RETRY_COUNT("43316")))).toBeGreaterThan(0);
+    // маркер нагляду продовжує жити, інакше гляд тихо згасне
+    expect(expirations.get(REDIS_KEYS.FISCALIZATION_WATCH("43316"))).toBe(
+      CONFIG.FISCALIZATION_WATCH_TTL_SEC,
+    );
+  });
+
+  test("успішний стукіт також лишається в книзі подій", async () => {
+    fiscalCards["43317"] = { status_id: 2, fiscal_status: "done" };
+
+    await knock(43317);
+
+    const events = (await fakeRedis.lrange(REDIS_KEYS.FISCALIZATION_EVENTS, 0, 9)) as string[];
+    const actions = events.map((raw) => JSON.parse(raw).action);
+    expect(actions).toContain("knock_received");
+    expect(actions).toContain("moved_to_bas");
   });
 });
